@@ -1,4 +1,5 @@
 // server.js — SOL WhatsApp Assistant (Meta Webhook, multilingual, Vision OCR, KB + Embeddings)
+// Version: 2025-11-09.r2
 // -------------------------------------------------------------------------------------------
 // Replit secrets required:
 //   VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, OPENAI_API_KEY
@@ -19,6 +20,8 @@ import FormData from "form-data";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
+
+const VERSION = "2025-11-09.r2";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -82,8 +85,8 @@ async function downloadMedia(url) {
 const KB_DIR = path.join(__dirname, "kb");
 let KB_DOCS = [];       // [{name, text}]
 let KB_CHUNKS = [];     // [{id, doc, chunk, text, embedding: number[]}]
-const CHUNK_SIZE = 1200;     // символов
-const CHUNK_OVERLAP = 200;   // символов
+const CHUNK_SIZE = 1200;
+const CHUNK_OVERLAP = 200;
 
 function safeRead(p) { try { return fs.readFileSync(p, "utf8"); } catch { return ""; } }
 
@@ -140,7 +143,6 @@ async function buildKBEmbeddings() {
     KB_DOCS.push({ name: fn, text });
   }
 
-  // chunking
   const allChunks = [];
   for (const d of KB_DOCS) {
     const chunks = splitIntoChunks(d.text);
@@ -150,7 +152,6 @@ async function buildKBEmbeddings() {
   }
   console.log(`KB: chunked into ${allChunks.length} chunk(s).`);
 
-  // embeddings (batching to avoid very long inputs)
   const BATCH = 64;
   let idCounter = 0;
   for (let i = 0; i < allChunks.length; i += BATCH) {
@@ -174,7 +175,6 @@ function topKRelevant(queryEmbedding, k = 6) {
 
 function formatContextFromChunks(chunks, maxChars = 7000) {
   if (!chunks.length) return "";
-  // group by doc for nicer headers
   let acc = "### KB matched context\n";
   let used = 0;
   for (const ch of chunks) {
@@ -224,6 +224,8 @@ async function ensureUserLang(from, valueObj, sampleText) {
   return guess;
 }
 
+// Translate UI/system phrases to user's lang (fallback EN)
+// (обновили system-промпт: никаких «извините/ограничений»)
 async function trFor(user, english) {
   const lang = userLang.get(user) || "en";
   if (lang === "en") return english;
@@ -232,7 +234,9 @@ async function trFor(user, english) {
       model: OPENAI_MODEL,
       temperature: 0.2,
       messages: [
-        { role: "system", content: `Translate the following UI string to ${lang}. Keep it short and natural.` },
+        { role: "system",
+          content: `Translate the following UI string to ${lang}.
+Keep it short and natural. Do not add apologies, disclaimers, or capability statements.` },
         { role: "user", content: english },
       ],
     });
@@ -242,9 +246,8 @@ async function trFor(user, english) {
   }
 }
 
-// === Chat using retrieved KB chunks ===
+// === Chat using retrieved KB chunks (обновили system-промпт) ===
 async function chatWithKB(userText, userLangCode="en") {
-  // 1) embed query
   let ctx = "";
   try {
     const q = await openai.embeddings.create({
@@ -260,11 +263,11 @@ async function chatWithKB(userText, userLangCode="en") {
 
   const system =
 `You are SOL — a warm, human assistant for SOL employees in Finland.
-- Always respond in the user's language: ${userLangCode}.
+- Respond in the user's current language (${userLangCode}). If the user writes in another language, follow the user's latest message language.
 - Be concise (3–7 short sentences), friendly, and practical.
-- Prefer ONLY facts from [KB CONTEXT] when relevant to SOL rules/rights/chemicals/safety.
-- If the answer is not in [KB CONTEXT], say you don't know and suggest checking with a supervisor/HR.
-- Do NOT invent payroll numbers or legal facts.`;
+- Prefer ONLY facts from [KB CONTEXT] for SOL rules/rights/chemicals/safety. If the answer is not in [KB CONTEXT], say you don't know and suggest checking with a supervisor/HR.
+- Do not mention training data, knowledge cutoffs, or your internal limitations unless explicitly asked.
+- Do not say you can answer only in one language. Just answer in the language the user is using.`;
 
   const messages = [
     { role: "system", content: system + (ctx ? `\n\n[KB CONTEXT]\n${ctx}` : "") },
@@ -326,6 +329,41 @@ async function ocrImageBuffer(buf) {
   }
 }
 
+// === PAM pay table helper ===
+function currentPamTable(date = new Date()) {
+  const d = new Date(date);
+  if (d >= new Date('2027-07-01')) return '2027';
+  if (d >= new Date('2026-08-01')) return '2026';
+  return '2025';
+}
+
+const PAM_HOURLY = {
+  "2025": [11.03,12.26,12.88,13.52,14.20,14.90,15.50,16.12,16.77,17.44],
+  "2026": [11.33,12.59,13.22,13.88,14.58,15.30,15.92,16.55,17.22,17.90],
+  "2027": [11.60,12.89,13.54,14.21,14.92,15.67,16.30,16.95,17.63,18.33],
+};
+
+function getHourlyByGroup(group1to10, date = new Date()) {
+  const yearKey = currentPamTable(date);
+  const arr = PAM_HOURLY[yearKey];
+  const idx = Math.max(1, Math.min(10, group1to10)) - 1;
+  return { rate: arr[idx], table: yearKey };
+}
+
+function groupFromPoints(points) {
+  if (points < 17) return 1;
+  if (points <= 20) return 2;
+  if (points <= 24) return 3;
+  if (points <= 28) return 4;
+  if (points <= 33) return 5;
+  if (points <= 38) return 6;
+  if (points <= 44) return 7;
+  if (points <= 51) return 8;
+  if (points <= 58) return 9;
+  return 10;
+}
+
+
 // === Welcome (once per number) ===
 const seenUsers = new Set();
 async function maybeSendWelcome(from) {
@@ -354,11 +392,22 @@ function parseArrowTranslate(m) {
   return { target: t[1].toLowerCase(), text: m.slice(t[0].indexOf(t[2])).trim() || t[2].trim() };
 }
 
+// === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
   await maybeSendWelcome(from);
 
   const m = (body || "").trim();
+
+  // авто-переключение языка, если пользователь сменил язык в этом сообщении
+  try {
+    const latestCode = await detectLangByText(m);
+    const prevCode = userLang.get(from);
+    if (latestCode && latestCode !== prevCode) {
+      userLang.set(from, latestCode);
+      console.log(`Language switched for ${from}: ${prevCode} -> ${latestCode}`);
+    }
+  } catch {}
 
   // KB admin
   if (/^kb\??$/i.test(m)) {
@@ -404,13 +453,25 @@ async function handleIncomingText(from, valueObj, body) {
   }
 
   // general Q&A — use retrieved KB chunks
-  const answer = await chatWithKB(m, lang);
+  const answer = await chatWithKB(m, userLang.get(from) || lang || "en");
   await sendText(from, answer);
 }
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
   const lang = await ensureUserLang(from, valueObj, caption || "");
   await maybeSendWelcome(from);
+
+  // авто-переключение языка по подписи к изображению
+  if (caption) {
+    try {
+      const latestCode = await detectLangByText(caption);
+      const prevCode = userLang.get(from);
+      if (latestCode && latestCode !== prevCode) {
+        userLang.set(from, latestCode);
+        console.log(`Language switched (image caption) for ${from}: ${prevCode} -> ${latestCode}`);
+      }
+    } catch {}
+  }
 
   try {
     const url = await getMediaUrl(mediaId);
@@ -432,10 +493,9 @@ async function handleIncomingImage(from, mediaId, caption, valueObj) {
     await sendText(from, await trFor(from, "I read the text from your image. Here is the beginning:"));
     await sendText(from, text.slice(0, 900));
 
-    // If caption contains a question — answer using KB + OCR context
     if (caption && caption.trim()) {
       const q = `${caption}\n\n(Consider this OCR context):\n${text}`;
-      const follow = await chatWithKB(q, lang);
+      const follow = await chatWithKB(q, userLang.get(from) || lang || "en");
       await sendText(from, follow);
     } else {
       await sendText(from, await trFor(from,
@@ -451,6 +511,18 @@ async function handleIncomingImage(from, mediaId, caption, valueObj) {
 async function handleIncomingDocument(from, mediaId, filename, valueObj) {
   const lang = await ensureUserLang(from, valueObj, filename || "");
   await maybeSendWelcome(from);
+
+  // (под документ автосмена языка обычно не нужна, но не помешает по названию)
+  if (filename) {
+    try {
+      const latestCode = await detectLangByText(filename);
+      const prevCode = userLang.get(from);
+      if (latestCode && latestCode !== prevCode) {
+        userLang.set(from, latestCode);
+        console.log(`Language switched (doc filename) for ${from}: ${prevCode} -> ${latestCode}`);
+      }
+    } catch {}
+  }
 
   try {
     const url = await getMediaUrl(mediaId);
@@ -518,11 +590,12 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// === Health ===
-app.get("/", (_req, res) => res.send("WhatsApp SOL assistant is running ✅"));
+// === Health/Version ===
+app.get("/", (_req, res) => res.send(`WhatsApp SOL assistant is running ✅ v${VERSION}`));
+app.get("/version", (_req, res) => res.send(`SOL Assistant version ${VERSION}`));
 
 app.listen(PORT, async () => {
-  console.log("Bot on port:", PORT);
+  console.log(`Bot on port: ${PORT} (v${VERSION})`);
   try {
     const list = await openai.models.list();
     console.log("✅ OpenAI API ok:", list.data?.length ?? "n/a");
