@@ -380,16 +380,77 @@ async function maybeSendWelcome(from) {
   await sendText(from, await trFor(from, msgEN));
 }
 
-// === Commands & routing ===
-const SCHED_RX = new RegExp(
-  String.raw`(schedule|shift|rota|roster|timetable|calendar|aikataulu|vuorolist|vuoro|graafik|расписан|график|смен|calendario|horario|agenda|plano|planeacion|program|勤務|일정)`,
-  "i"
-);
+
 
 function parseArrowTranslate(m) {
   const t = m.match(/^->\s*([a-z]{2})\s+([\s\S]+)$/i);
   if (!t) return null;
   return { target: t[1].toLowerCase(), text: m.slice(t[0].indexOf(t[2])).trim() || t[2].trim() };
+}
+
+// === Universal "schedule" intent detector (hybrid) ===
+
+// 1) быстрый словарик
+const SCHEDULE_KEYWORDS = [
+  "schedule","shift","calendar","horario","calendario","grafik","duty",
+  "расписание","смен","календарь",
+  "aikataulu","vuorolista",
+  "समय","कार्यतालिका","शिफ्ट",
+  "সময়সূচি","ক্যালেন্ডার","শিফট",
+  "时间表","班表","工作时间",
+  "勤務表","シフト","スケジュール"
+];
+const SCHEDULE_COMBOS = [
+  ["today","shift"], ["work","hours"], ["job","time"],
+  ["сегодня","смен"], ["график","работ"], ["vuoro","tänään"],
+  ["আজ","শিফট"], ["班","今天"]
+];
+
+function fastScheduleHit(text) {
+  const t = (text || "").toLowerCase();
+  if (SCHEDULE_KEYWORDS.some(w => t.includes(w))) return true;
+  for (const [a,b] of SCHEDULE_COMBOS) {
+    if (t.includes(a) && t.includes(b)) return true;
+  }
+  return false;
+}
+
+// 2) точный AI-классификатор (отвечает yes/no)
+async function isScheduleIntentAI(text, langCode) {
+  try {
+    const r = await axios.post("https://api.openai.com/v1/chat/completions", {
+      model: process.env.OPENAI_CLASSIFIER_MODEL || "gpt-4o-mini",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content:
+`You are a strict intent classifier. Answer exactly "yes" or "no".
+Task: Does the user ask for shift schedule or a link to the schedule/calendar?`
+        },
+        {
+          role: "user",
+          content:
+`Language: ${langCode || "unknown"}
+Text: """${(text||"").slice(0,600)}"""` // защита от длинных сообщений
+        }
+      ]
+    }, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
+    });
+
+    const out = r.data?.choices?.[0]?.message?.content?.trim().toLowerCase() || "no";
+    return out.startsWith("y"); // yes -> true, иначе false
+  } catch (e) {
+    console.error("schedule intent AI error:", e?.response?.data || e.message);
+    return false;
+  }
+}
+
+// 3) общий вход
+async function looksLikeScheduleRequestSmart(text, langCode) {
+  if (fastScheduleHit(text)) return true;
+  return await isScheduleIntentAI(text, langCode);
 }
 
 // === Handlers ===
@@ -409,6 +470,16 @@ async function handleIncomingText(from, valueObj, body) {
     }
   } catch {}
 
+ if (await looksLikeScheduleRequestSmart(m, userLang)) {
+  const parts = [
+    `• ${await trFor(from, "Open page")}: ${INDEX_URL}`,
+    `• ${await trFor(from, "ICS base (choose your card)")}: ${ICS_URL_BASE}`
+  ];
+  await sendText(from, (await trFor(from, "Schedule")) + ":\n" + parts.join("\n"));
+  return;
+}
+  
+
   // KB admin
   if (/^kb\??$/i.test(m)) {
     const list = KB_DOCS.length ? KB_DOCS.map(d => `• ${d.name}`).join("\n") : "(empty)";
@@ -421,15 +492,7 @@ async function handleIncomingText(from, valueObj, body) {
     return;
   }
 
-  // schedule
-  if (SCHED_RX.test(m)) {
-    const parts = [
-      `• ${await trFor(from, "Open page")}: ${INDEX_URL}`,
-      `• ${await trFor(from, "ICS base (choose your card)")}: ${ICS_URL_BASE}`
-    ];
-    await sendText(from, (await trFor(from, "Schedule")) + ":\n" + parts.join("\n"));
-    return;
-  }
+
 
   // translate arrows
   const arrow = parseArrowTranslate(m);
