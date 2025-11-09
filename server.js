@@ -563,11 +563,39 @@ const CHITCHAT_RE = /(?:поболтаем|поговорим|просто ча�
 // === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
-  await maybeSendWelcome(from);
-
   const m = (body || "").trim();
 
-  // авто-переключение языка, если пользователь сменил язык в этом сообщении
+  // сброс персональных параметров
+  if (/^(reset|сброс)\s*(rate|ставка)?/i.test(m)) {
+    USER_STATE.delete(from);
+    await sendText(from, lang === "ru"
+      ? "Ок, сбросил ставку и часы для расчетов."
+      : lang === "fi"
+      ? "Ok, nollasin tuntipalkan ja viikkotunnit."
+      : "Okay, I reset hourly rate and weekly hours.");
+    return;
+  }
+
+  // просто поболтать
+  if (CHITCHAT_RE.test(m)) {
+    await sendText(from,
+      lang === "ru"
+        ? "Конечно, можем просто поболтать 😊 Как ты сегодня?"
+        : lang === "fi"
+        ? "Totta kai, voidaan vain jutella 😊 Miten päiväsi on mennyt?"
+        : "Sure, we can just chat 😊 How’s your day going?");
+    return;
+  }
+
+  // фиксируем, если пользователь прислал ставку/часы
+  const foundRate = parseHourlyRate(m);
+  const foundHours = parseHoursPerWeek(m);
+  const st = USER_STATE.get(from) || {};
+  if (foundRate) st.rate = foundRate;
+  if (foundHours) st.hoursPerWeek = foundHours;
+  if (foundRate || foundHours) USER_STATE.set(from, st);
+
+  // авто-переключение языка по последнему сообщению
   try {
     const latestCode = await detectLangByText(m);
     const prevCode = userLang.get(from);
@@ -577,120 +605,53 @@ async function handleIncomingText(from, valueObj, body) {
     }
   } catch {}
 
- if (await looksLikeScheduleRequestSmart(m, userLang)) {
-  const parts = [
-    `• ${await trFor(from, "Open page")}: ${INDEX_URL}`,
-   // `• ${await trFor(from, "ICS base (choose your card)")}: ${ICS_URL_BASE}`
-  ];
-  await sendText(from, (await trFor(from, "Schedule")) + ":\n" + parts.join("\n"));
-  return;
+  // расписание (как было)
+  if (SCHED_REGEX.test(m)) {
+    await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
+    return;
+  }
+
+  // дефолтная ставка PAM (группа 2)
+  const { rate: DEFAULT_RATE, table: PAM_TABLE } = getHourlyByGroup(2, new Date());
+
+  // системный промпт для OpenAI
+  const system = `
+You are SOL — a warm, human assistant for SOL employees in Finland.
+- Respond in the user's current language (${lang}). If the user writes in another language, follow their latest message language.
+- Be concise (3–7 short sentences), friendly, and practical.
+- Prefer ONLY facts from [KB CONTEXT] for SOL rules/rights/chemicals/safety. If the answer is not in [KB CONTEXT], say you don't know and suggest checking with a supervisor/HR.
+- Do not mention training data, knowledge cutoffs, or limitations. Do not claim you can answer only one language.
+
+DEFAULT_ASSUMPTIONS:
+- If the user didn't specify an hourly rate, assume €${DEFAULT_RATE.toFixed(2)}/h (PAM group 2, table ${PAM_TABLE}).
+- If the user later gives another rate, use it for this user.
+- Monthly pay ≈ hours_per_week × 52 / 12 (≈4.33 weeks).
+${
+  st.rate
+    ? `USER CONTEXT: hourly_rate=€${st.rate.toFixed(2)}.`
+    : `USER CONTEXT: hourly_rate (assumed)=€${DEFAULT_RATE.toFixed(2)}.`
 }
+${st.hoursPerWeek ? `USER CONTEXT: hours_per_week=${st.hoursPerWeek}.` : ""}
+`;
 
-  // ===== Salary intent (remember & calculate) =====
-{
-  // обновим память диалога
-  pushToHistory(from, "user", m);
+  const kb = kbContextSnippet ? kbContextSnippet() : "";
+  const userPrompt = kb
+    ? `KB START\n${kb}\nKB END\n\nQUESTION:\n${m}`
+    : `QUESTION:\n${m}\n\n(No KB loaded)`;
 
-  // 3.1. Обновляем профиль из текущего сообщения, если видим данные
-  const maybeHourly = parseHourly(m);
-  const maybeHpw    = parseHoursPerWeek(m);
-  const profPrev    = getProfile(from);
-  const prof = setProfile(from, {
-    hourly: (maybeHourly ?? profPrev.hourly ?? null),
-    hoursPerWeek: (maybeHpw ?? profPrev.hoursPerWeek ?? null)
+  const r = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.6,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: userPrompt }
+    ]
   });
 
-  // 3.2. Если человек говорит «обычная ставка» — зафиксируем дефолт
-  if (/обычн|простой|стандартн|normal|perus/i.test(m) && !prof.hourly) {
-    prof.hourly = DEFAULT_HOURLY;
-  }
-
-  // 3.3. Поймём, просит ли он посчитать «за месяц»
-  const askMonthly = /(за месяц|kuukaudessa|per month|bulan|місяць|місяця|місяці|місяців|月|ヶ月|місяц)/i.test(m)
-                  || /(сколько|какая|what|how much).{0,40}(зарплат|salary|palkka|paga|pay)/i.test(m)
-                  || /(20|30|40)\s*(h|ч|t|hrs)/i.test(m); // грубо: упоминание часов
-
-  // 3.4. Если просит посчитать и у нас есть хоть что-то
-  if (askMonthly && (prof.hoursPerWeek || maybeHpw || prof.hourly || maybeHourly)) {
-    const hpw = prof.hoursPerWeek || maybeHpw || 0;
-    const hr  = prof.hourly || maybeHourly || DEFAULT_HOURLY;
-
-    // расчёт двумя способами — «4 недели» и «52/12»
-    const by433 = monthlyFromWeeklyHours(hr, hpw, 52/12); // точнее
-    const by4w  = monthlyFromWeeklyHours(hr, hpw, 4.0);   // грубая оценка
-
-    const reply =
-      await trFor(from,
-        `Ок, считаю по твоим данным.\n` +
-        `• Ставка: €${hr.toFixed(2)}/ч\n` +
-        `• Часы в неделю: ${hpw}\n\n` +
-        `Приблизительно в месяц:\n` +
-        `• По 52/12 (≈4.33 недели): €${by433}\n` +
-        `• По 4 неделям: €${by4w}\n\n` +
-        `Фактически платят за реально отработанные часы. Если будет другая ставка — скажи новую цифру, я запомню.`
-      );
-
-    await sendText(from, reply);
-    setProfile(from, { lastTopic: "salary" });
-    return;
-  }
-
-  // 3.5. Если он продолжает тему зарплаты общим вопросом — удержим контекст
-  if ( (profPrev.lastTopic === "salary" || /зарплат|salary|palkka/i.test(m)) &&
-       (prof.hourly || prof.hoursPerWeek) ) {
-    const hr  = prof.hourly || DEFAULT_HOURLY;
-    const hpw = prof.hoursPerWeek || 0;
-    const by433 = monthlyFromWeeklyHours(hr, hpw, 52/12);
-    const tip = await trFor(from,
-      `Пока у меня запомнено: ставка €${hr.toFixed(2)}/ч и ${hpw} ч/нед.\n` +
-      `Хочешь — назови новые числа, и я пересчитаю.`
-    );
-    await sendText(from, tip);
-    setProfile(from, { lastTopic: "salary" });
-    return;
-  }
+  const out = r.choices?.[0]?.message?.content?.trim() || "(no reply)";
+  await sendText(from, out);
 }
-  
 
-  // KB admin
-  if (/^kb\??$/i.test(m)) {
-    const list = KB_DOCS.length ? KB_DOCS.map(d => `• ${d.name}`).join("\n") : "(empty)";
-    await sendText(from, `KB docs: ${KB_DOCS.length}\n${list}`);
-    return;
-  }
-  if (/^kb:\s*reload$/i.test(m)) {
-    await buildKBEmbeddings().catch(err => console.error("KB rebuild error:", err?.response?.data || err.message));
-    await sendText(from, `KB reloaded: ${KB_DOCS.length} file(s), ${KB_CHUNKS.length} chunks.`);
-    return;
-  }
-
-
-
-  // translate arrows
-  const arrow = parseArrowTranslate(m);
-  if (arrow) {
-    try {
-      const r = await openai.chat.completions.create({
-        model: OPENAI_MODEL,
-        temperature: 0.15,
-        messages: [
-          { role: "system", content: `Translate to ${arrow.target}. Keep meaning, tone, and formatting.` },
-          { role: "user", content: arrow.text }
-        ]
-      });
-      const out = r.choices?.[0]?.message?.content?.trim() || arrow.text;
-      await sendText(from, out);
-    } catch (e) {
-      console.error("translate error:", e?.response?.data || e.message);
-      await sendText(from, await trFor(from, "Sorry, I couldn't translate right now."));
-    }
-    return;
-  }
-
-  // general Q&A — use retrieved KB chunks
-  const answer = await chatWithKB(m, userLang.get(from) || lang || "en");
-  await sendText(from, answer);
-}
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
   const lang = await ensureUserLang(from, valueObj, caption || "");
