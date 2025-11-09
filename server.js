@@ -41,6 +41,61 @@ const {
 const OPENAI_MODEL     = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const EMBEDDING_MODEL  = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
 
+// ==== Light memory & defaults ====
+const DEFAULT_HOURLY = 12.26;  // базовая ставка по умолчанию (твоя группа 2)
+const MAX_TURNS = 8;
+
+const STATE = new Map(); // phone -> { lang, history: [{role,content}], profile: {hourly, hoursPerWeek, lastTopic} }
+
+function getState(id) {
+  if (!STATE.has(id)) STATE.set(id, { lang: 'en', history: [], profile: {} });
+  return STATE.get(id);
+}
+
+function pushToHistory(id, role, content) {
+  const s = getState(id);
+  s.history.push({ role, content });
+  while (s.history.length > MAX_TURNS) s.history.shift();
+}
+
+function setProfile(id, patch) {
+  const s = getState(id);
+  s.profile = { ...(s.profile||{}), ...patch };
+  return s.profile;
+}
+
+function getProfile(id) {
+  return getState(id).profile || {};
+}
+
+// ==== Salary helpers ====
+// корректнее считать месяц как 52/12 ≈ 4.333 недели
+function monthlyFromWeeklyHours(hourly, hoursPerWeek, weeksPerMonth = 52/12) {
+  const h = Number(hoursPerWeek || 0);
+  const r = Number(hourly || DEFAULT_HOURLY);
+  return +(r * h * weeksPerMonth).toFixed(2); // €
+}
+
+// парсим «ставку» и «часы в неделю» из текста на любых языках (простые паттерны)
+function parseHourly(text) {
+  // ищем что-то типа 12,26 €/ч | 12.26 €/h | ставка 12,26
+  const m = (text||"").match(/(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:€|eur)?\s*(?:\/?\s*(?:h|ч))?/i);
+  if (!m) return null;
+  return parseFloat(m[1].replace(',', '.'));
+}
+
+function parseHoursPerWeek(text) {
+  // ищем 20 h/week | 20ч в неделю | 20 h viikossa | 20 hours
+  const t = (text||"").toLowerCase();
+  // явные конструкции «в неделю»
+  let m = t.match(/(\d{1,3})\s*(?:h|ч|t|hrs|hours|tuntia).{0,12}(?:week|нед|viikossa)/i);
+  if (m) return parseInt(m[1], 10);
+  // упрощённо — одиночное «20 ч/часов», без «в неделю»
+  m = t.match(/(\d{1,3})\s*(?:h|ч|t|hrs|hours|tuntia)\b/i);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+
 // === OpenAI client ===
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
@@ -477,6 +532,71 @@ async function handleIncomingText(from, valueObj, body) {
   ];
   await sendText(from, (await trFor(from, "Schedule")) + ":\n" + parts.join("\n"));
   return;
+}
+
+  // ===== Salary intent (remember & calculate) =====
+{
+  // обновим память диалога
+  pushToHistory(from, "user", m);
+
+  // 3.1. Обновляем профиль из текущего сообщения, если видим данные
+  const maybeHourly = parseHourly(m);
+  const maybeHpw    = parseHoursPerWeek(m);
+  const profPrev    = getProfile(from);
+  const prof = setProfile(from, {
+    hourly: (maybeHourly ?? profPrev.hourly ?? null),
+    hoursPerWeek: (maybeHpw ?? profPrev.hoursPerWeek ?? null)
+  });
+
+  // 3.2. Если человек говорит «обычная ставка» — зафиксируем дефолт
+  if (/обычн|простой|стандартн|normal|perus/i.test(m) && !prof.hourly) {
+    prof.hourly = DEFAULT_HOURLY;
+  }
+
+  // 3.3. Поймём, просит ли он посчитать «за месяц»
+  const askMonthly = /(за месяц|kuukaudessa|per month|bulan|місяць|місяця|місяці|місяців|月|ヶ月|місяц)/i.test(m)
+                  || /(сколько|какая|what|how much).{0,40}(зарплат|salary|palkka|paga|pay)/i.test(m)
+                  || /(20|30|40)\s*(h|ч|t|hrs)/i.test(m); // грубо: упоминание часов
+
+  // 3.4. Если просит посчитать и у нас есть хоть что-то
+  if (askMonthly && (prof.hoursPerWeek || maybeHpw || prof.hourly || maybeHourly)) {
+    const hpw = prof.hoursPerWeek || maybeHpw || 0;
+    const hr  = prof.hourly || maybeHourly || DEFAULT_HOURLY;
+
+    // расчёт двумя способами — «4 недели» и «52/12»
+    const by433 = monthlyFromWeeklyHours(hr, hpw, 52/12); // точнее
+    const by4w  = monthlyFromWeeklyHours(hr, hpw, 4.0);   // грубая оценка
+
+    const reply =
+      await trFor(from,
+        `Ок, считаю по твоим данным.\n` +
+        `• Ставка: €${hr.toFixed(2)}/ч\n` +
+        `• Часы в неделю: ${hpw}\n\n` +
+        `Приблизительно в месяц:\n` +
+        `• По 52/12 (≈4.33 недели): €${by433}\n` +
+        `• По 4 неделям: €${by4w}\n\n` +
+        `Фактически платят за реально отработанные часы. Если будет другая ставка — скажи новую цифру, я запомню.`
+      );
+
+    await sendText(from, reply);
+    setProfile(from, { lastTopic: "salary" });
+    return;
+  }
+
+  // 3.5. Если он продолжает тему зарплаты общим вопросом — удержим контекст
+  if ( (profPrev.lastTopic === "salary" || /зарплат|salary|palkka/i.test(m)) &&
+       (prof.hourly || prof.hoursPerWeek) ) {
+    const hr  = prof.hourly || DEFAULT_HOURLY;
+    const hpw = prof.hoursPerWeek || 0;
+    const by433 = monthlyFromWeeklyHours(hr, hpw, 52/12);
+    const tip = await trFor(from,
+      `Пока у меня запомнено: ставка €${hr.toFixed(2)}/ч и ${hpw} ч/нед.\n` +
+      `Хочешь — назови новые числа, и я пересчитаю.`
+    );
+    await sendText(from, tip);
+    setProfile(from, { lastTopic: "salary" });
+    return;
+  }
 }
   
 
