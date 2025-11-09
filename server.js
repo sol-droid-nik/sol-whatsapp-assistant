@@ -508,6 +508,58 @@ async function looksLikeScheduleRequestSmart(text, langCode) {
   return await isScheduleIntentAI(text, langCode);
 }
 
+// === PAM pay tables (минималки по PAM) ===
+function currentPamTable(date = new Date()) {
+  const d = new Date(date);
+  if (d >= new Date('2027-07-01')) return '2027';
+  if (d >= new Date('2026-08-01')) return '2026';
+  return '2025';
+}
+
+const PAM_HOURLY = {
+  "2025": [11.03,12.26,12.88,13.52,14.20,14.90,15.50,16.12,16.77,17.44],
+  "2026": [11.33,12.59,13.22,13.88,14.58,15.30,15.92,16.55,17.22,17.90],
+  "2027": [11.60,12.89,13.54,14.21,14.92,15.67,16.30,16.95,17.63,18.33],
+};
+
+function getHourlyByGroup(group1to10, date = new Date()) {
+  const yearKey = currentPamTable(date);
+  const arr = PAM_HOURLY[yearKey];
+  const idx = Math.max(1, Math.min(10, group1to10)) - 1;
+  return { rate: arr[idx], table: yearKey };
+}
+
+// === per-user state (ставка/часы) ===
+const USER_STATE = new Map(); // phone -> { rate?: number, hoursPerWeek?: number }
+
+// «12,26 €/ч», «12.26 eur/h», «ставка 12.26»
+function parseHourlyRate(text) {
+  const t = (text || "").replace(/\s+/g, " ").toLowerCase();
+  const m =
+    t.match(/(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)?\s*\/?\s*(?:h|ч|hr)?\b/) ||
+    t.match(/ставк[аи]:?\s*(\d{1,3}(?:[.,]\d{1,2})?)/) ||
+    t.match(/\b(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)\b/);
+  if (!m) return null;
+  const num = parseFloat(m[1].replace(",", "."));
+  if (!isFinite(num) || num < 6 || num > 40) return null; // защита от «€250»
+  return +(num.toFixed(2));
+}
+
+// «20 часов в неделю», «25h/week», «25 t/vko»
+function parseHoursPerWeek(text) {
+  const t = (text || "").toLowerCase();
+  const m =
+    t.match(/(\d{1,2})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|vko|viikk)/) ||
+    t.match(/(\d{1,2})\s*(?:час|h)\b/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (n < 5 || n > 40) return null;
+  return n;
+}
+
+// «режим поболтать»
+const CHITCHAT_RE = /(?:поболтаем|поговорим|просто чат|small talk|let'?s talk|я устал|мне грустно)/i;
+
 // === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
