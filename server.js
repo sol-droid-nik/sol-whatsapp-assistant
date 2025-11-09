@@ -473,7 +473,7 @@ async function handleIncomingText(from, valueObj, body) {
  if (await looksLikeScheduleRequestSmart(m, userLang)) {
   const parts = [
     `• ${await trFor(from, "Open page")}: ${INDEX_URL}`,
-    `• ${await trFor(from, "ICS base (choose your card)")}: ${ICS_URL_BASE}`
+   // `• ${await trFor(from, "ICS base (choose your card)")}: ${ICS_URL_BASE}`
   ];
   await sendText(from, (await trFor(from, "Schedule")) + ":\n" + parts.join("\n"));
   return;
