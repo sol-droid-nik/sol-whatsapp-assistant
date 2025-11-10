@@ -94,11 +94,11 @@ function parseHoursPerWeek(text) {
 
   // 1) прямое указание часов в неделю
   let m =
-    t.match(/(\d{1,3})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|vko|viikk)/i) ||
+    t.match(/(\d{1,3})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|недел[юи]|vko|viikk)/i) ||
     t.match(/(\d{1,3})\s*(?:tunn(?:in|tia)?)\s*(?:viikossa|\/vko)/i);
   if (m) {
     const n = parseInt(m[1], 10);
-    if (n >= 5 && n <= 84) return n;
+    if (n > 0 && n <= 100) return n;
   }
 
   // 2) "X часов в день, Y дней в неделю" (ru/en/fi)
@@ -107,13 +107,13 @@ function parseHoursPerWeek(text) {
     (t.match(/(\d{1,2})\s*h(?:ours)?\s*per\s*day/)?.[1]) ||
     (t.match(/(\d{1,2})\s*tunn(?:in|tia)\s*päivässä/)?.[1]);
   const daysW =
-    (t.match(/(\d{1,2})\s*дн(?:я|ей)\s*в\s*недел/)?.[1]) ||
+    (t.match(/(\d{1,2})\s*дн(?:я|ей)?\s*в\s*недел[юи]/)?.[1]) ||
     (t.match(/(\d{1,2})\s*days?\s*per\s*week/)?.[1]) ||
     (t.match(/(\d{1,2})\s*päivää\s*viikossa/)?.[1]);
 
   if (dayH && daysW) {
     const n = parseInt(dayH, 10) * parseInt(daysW, 10);
-    if (n >= 5 && n <= 84) return n;
+    if (n > 0 && n <= 100) return n;
   }
 
   return null;
