@@ -71,26 +71,52 @@ function monthlyBy4Weeks(hourly, hoursPerWeek) {
 }
 
 // парсим «ставку» и «часы в неделю» из текста на разных языках (простые паттерны)
+// ✅ Ставка: требуем явного указания валюты или слова "ставка",
+// чтобы не путать с выражениями типа "15 часов".
 function parseHourlyRate(text) {
-  const t = (text || "").replace(/\s+/g, " ").toLowerCase();
-  const m =
-    t.match(/(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)?\s*\/?\s*(?:h|ч|hr)?\b/) ||
-    t.match(/ставк[аи]:?\s*(\d{1,3}(?:[.,]\d{1,2})?)/) ||
-    t.match(/\b(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)\b/);
-  if (!m) return null;
-  const num = parseFloat(m[1].replace(",", "."));
-  if (!isFinite(num) || num < 6 || num > 40) return null; // защита от «€250»
-  return +(num.toFixed(2));
-}
-function parseHoursPerWeek(text) {
   const t = (text || "").toLowerCase();
   const m =
-    t.match(/(\d{1,2})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|vko|viikk)/) ||
-    t.match(/(\d{1,2})\s*(?:час|h)\b/);
+    t.match(/ставк[аи]?:?\s*(\d{1,3}(?:[.,]\d{1,2})?)/i) ||
+    t.match(/tunti?palkka[:\s]*?(\d{1,3}(?:[.,]\d{1,2})?)/i) ||
+    t.match(/(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)\s*\/?\s*(?:h|ч|hr)?\b/i) ||
+    t.match(/€\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*\/?\s*(?:h|ч|hr)?\b/i);
   if (!m) return null;
-  const n = parseInt(m[1], 10);
-  if (n < 5 || n > 60) return null;
-  return n;
+  const num = parseFloat(m[1].replace(",", "."));
+  if (!isFinite(num) || num < 6 || num > 40) return null;
+  return +(num.toFixed(2));
+}
+
+// ✅ Часы в неделю: поддерживаем варианты:
+// - "25 ч/нед", "25 h/week", "25 tuntia viikossa"
+// - "15 часов в день, 6 дней в неделю" → 15×6 = 90
+function parseHoursPerWeek(text) {
+  const t = (text || "").toLowerCase();
+
+  // 1) прямое указание часов в неделю
+  let m =
+    t.match(/(\d{1,3})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|vko|viikk)/i) ||
+    t.match(/(\d{1,3})\s*(?:tunn(?:in|tia)?)\s*(?:viikossa|\/vko)/i);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 5 && n <= 84) return n;
+  }
+
+  // 2) "X часов в день, Y дней в неделю" (ru/en/fi)
+  const dayH =
+    (t.match(/(\d{1,2})\s*час(?:а|ов)?\s*в\s*день/)?.[1]) ||
+    (t.match(/(\d{1,2})\s*h(?:ours)?\s*per\s*day/)?.[1]) ||
+    (t.match(/(\d{1,2})\s*tunn(?:in|tia)\s*päivässä/)?.[1]);
+  const daysW =
+    (t.match(/(\d{1,2})\s*дн(?:я|ей)\s*в\s*недел/)?.[1]) ||
+    (t.match(/(\d{1,2})\s*days?\s*per\s*week/)?.[1]) ||
+    (t.match(/(\d{1,2})\s*päivää\s*viikossa/)?.[1]);
+
+  if (dayH && daysW) {
+    const n = parseInt(dayH, 10) * parseInt(daysW, 10);
+    if (n >= 5 && n <= 84) return n;
+  }
+
+  return null;
 }
 const SALARY_INTENT =
   /(зарплат|сколько.*в\s*месяц|сколько.*получ[уи]|pay|salary|monthly|посчитай|рассчита[йть])/i;
@@ -466,36 +492,49 @@ async function handleIncomingText(from, valueObj, body) {
   }
 
   // ======== Детерминированный расчёт зарплаты ========
-  const wantsSalary = SALARY_INTENT.test(m) || typeof foundHours === "number" || typeof foundRate === "number";
-  if (wantsSalary) {
-    const rate = (typeof foundRate === "number" ? foundRate : (st.rate ?? DEFAULT_HOURLY));
-    const hours = (typeof foundHours === "number" ? foundHours : st.hoursPerWeek);
+const wantsSalary =
+  SALARY_INTENT.test(m) ||
+  typeof foundHours === "number" ||
+  typeof foundRate === "number";
 
-    if (!hours) {
-      await sendText(from,
-        lang === "ru"
-          ? `Скажи, пожалуйста, сколько часов в неделю работать? Сейчас возьму ставку €${rate.toFixed(2)}/ч по умолчанию.`
-          : lang === "fi"
-          ? `Kerro viikkotunnit. Oletuksena käytän tuntipalkkaa €${rate.toFixed(2)}/h.`
-          : `Tell me your weekly hours. I’ll use €${rate.toFixed(2)}/h by default.`);
-      return;
-    }
+if (wantsSalary) {
+  const rate =
+    typeof foundRate === "number"
+      ? foundRate
+      : st.rate ?? DEFAULT_HOURLY;
+  const hours =
+    typeof foundHours === "number"
+      ? foundHours
+      : st.hoursPerWeek;
 
-    const by433 = monthlyFromWeeklyHours(rate, hours, 52/12);
-    const by4   = monthlyBy4Weeks(rate, hours);
-
-    const reply =
-      lang === "ru"
-        ? `Хорошо, считаю по твоим данным.\n• Ставка: €${rate.toFixed(2)}/ч\n• Часы в неделю: ${hours}\n\nПриблизительно в месяц:\n• По 52/12 (≈4.33 недели): €${by433}\n• По 4 неделям: €${by4}\n\nПлатят за фактически отработанные часы. Могу пересчитать в любой момент.`
-        : lang === "fi"
-        ? `Lasketaan näin:\n• Tuntipalkka: €${rate.toFixed(2)}/h\n• Tunnit/viikko: ${hours}\n\nKuukaudessa arviolta:\n• 52/12 (≈4.33 vk): €${by433}\n• 4 viikkoa: €${by4}\n\nMaksetaan toteutuneiden tuntien mukaan. Voin laskea uudestaan milloin vain.`
-        : `Got it.\n• Hourly: €${rate.toFixed(2)}/h\n• Hours/week: ${hours}\n\nApprox. per month:\n• 52/12 (≈4.33 weeks): €${by433}\n• 4 weeks: €${by4}\n\nPay is for actual hours. I can recalc anytime.`;
-
-    await sendText(from, reply);
+  if (!hours) {
+    await sendText(
+      from,
+      await trFor(
+        from,
+        `Tell me your weekly hours. I’ll use €${rate.toFixed(
+          2
+        )}/h by default.`
+      )
+    );
     return;
   }
-  // ======== /расчёт зарплаты ========
 
+  const by433 = monthlyFromWeeklyHours(rate, hours, 52 / 12);
+  const by4 = monthlyBy4Weeks(rate, hours);
+
+  // Основной текст (на английском как базовый)
+  let replyBase = `Here’s the estimate based on your data:\n• Hourly rate: €${rate.toFixed(
+    2
+  )}/h\n• Hours per week: ${hours}\n\nApproximate monthly pay:\n• Using 52/12 (≈4.33 weeks): €${by433}\n• Using 4 weeks: €${by4}\n\nPay is based on actual hours worked. I can recalculate anytime.\n\n💬 These amounts are before taxes.`;
+
+  // Переводим всё на язык пользователя
+  const replyTranslated = await trFor(from, replyBase);
+
+  await sendText(from, replyTranslated);
+  return;
+}
+// ======== /расчёт зарплаты ========
   // остальное — добрый «живой» ассистент на базе KB
   const follow = await chatWithKB(m, userLang.get(from) || lang || "en");
   await sendText(from, follow);
