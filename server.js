@@ -552,7 +552,6 @@ USER_STATE.set(from, st);
   // фиксируем, если пользователь прислал ставку/часы
   const foundRate = parseHourlyRate(m);
   const foundHours = parseHoursPerWeek(m);
-  const st = USER_STATE.get(from) || {};
   if (st.rate && st.rate < 7) delete st.rate; // ниже МРОТ — выбрасываем
   if (foundRate) st.rate = foundRate;
   if (foundHours) st.hoursPerWeek = foundHours;
