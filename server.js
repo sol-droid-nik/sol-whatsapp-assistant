@@ -1,13 +1,5 @@
 // server.js — SOL WhatsApp Assistant (Meta Webhook, multilingual, Vision OCR, KB + Embeddings)
-// Version: 2025-11-09.r2
-// -------------------------------------------------------------------------------------------
-// Replit secrets required:
-//   VERIFY_TOKEN, WHATSAPP_TOKEN, PHONE_NUMBER_ID, OPENAI_API_KEY
-//   INDEX_URL, ICS_URL_BASE
-// Optional:
-//   OCR_API_KEY            (fallback OCR.Space)
-//   OPENAI_MODEL           (default: gpt-4o-mini)
-//   EMBEDDING_MODEL        (default: text-embedding-3-small)
+// Version: 2025-11-09.r3 (fix salary + small talk; schedule bug; kb call)
 // -------------------------------------------------------------------------------------------
 
 import express from "express";
@@ -21,7 +13,7 @@ import FormData from "form-data";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
-const VERSION = "2025-11-09.r2";
+const VERSION = "2025-11-09.r3";
 
 const app = express();
 app.use(express.json({ limit: "25mb" }));
@@ -42,7 +34,7 @@ const OPENAI_MODEL     = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const EMBEDDING_MODEL  = process.env.EMBEDDING_MODEL || "text-embedding-3-small";
 
 // ==== Light memory & defaults ====
-const DEFAULT_HOURLY = 12.26;  // базовая ставка по умолчанию (твоя группа 2)
+const DEFAULT_HOURLY = 12.26;  // базовая ставка по умолчанию (PAM группа 2)
 const MAX_TURNS = 8;
 
 const STATE = new Map(); // phone -> { lang, history: [{role,content}], profile: {hourly, hoursPerWeek, lastTopic} }
@@ -51,19 +43,16 @@ function getState(id) {
   if (!STATE.has(id)) STATE.set(id, { lang: 'en', history: [], profile: {} });
   return STATE.get(id);
 }
-
 function pushToHistory(id, role, content) {
   const s = getState(id);
   s.history.push({ role, content });
   while (s.history.length > MAX_TURNS) s.history.shift();
 }
-
 function setProfile(id, patch) {
   const s = getState(id);
   s.profile = { ...(s.profile||{}), ...patch };
   return s.profile;
 }
-
 function getProfile(id) {
   return getState(id).profile || {};
 }
@@ -75,26 +64,36 @@ function monthlyFromWeeklyHours(hourly, hoursPerWeek, weeksPerMonth = 52/12) {
   const r = Number(hourly || DEFAULT_HOURLY);
   return +(r * h * weeksPerMonth).toFixed(2); // €
 }
+function monthlyBy4Weeks(hourly, hoursPerWeek) {
+  const h = Number(hoursPerWeek || 0);
+  const r = Number(hourly || DEFAULT_HOURLY);
+  return +(r * h * 4).toFixed(2); // €
+}
 
-// парсим «ставку» и «часы в неделю» из текста на любых языках (простые паттерны)
-function parseHourly(text) {
-  // ищем что-то типа 12,26 €/ч | 12.26 €/h | ставка 12,26
-  const m = (text||"").match(/(\d{1,2}(?:[.,]\d{1,2})?)\s*(?:€|eur)?\s*(?:\/?\s*(?:h|ч))?/i);
+// парсим «ставку» и «часы в неделю» из текста на разных языках (простые паттерны)
+function parseHourlyRate(text) {
+  const t = (text || "").replace(/\s+/g, " ").toLowerCase();
+  const m =
+    t.match(/(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)?\s*\/?\s*(?:h|ч|hr)?\b/) ||
+    t.match(/ставк[аи]:?\s*(\d{1,3}(?:[.,]\d{1,2})?)/) ||
+    t.match(/\b(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)\b/);
   if (!m) return null;
-  return parseFloat(m[1].replace(',', '.'));
+  const num = parseFloat(m[1].replace(",", "."));
+  if (!isFinite(num) || num < 6 || num > 40) return null; // защита от «€250»
+  return +(num.toFixed(2));
 }
-
 function parseHoursPerWeek(text) {
-  // ищем 20 h/week | 20ч в неделю | 20 h viikossa | 20 hours
-  const t = (text||"").toLowerCase();
-  // явные конструкции «в неделю»
-  let m = t.match(/(\d{1,3})\s*(?:h|ч|t|hrs|hours|tuntia).{0,12}(?:week|нед|viikossa)/i);
-  if (m) return parseInt(m[1], 10);
-  // упрощённо — одиночное «20 ч/часов», без «в неделю»
-  m = t.match(/(\d{1,3})\s*(?:h|ч|t|hrs|hours|tuntia)\b/i);
-  if (m) return parseInt(m[1], 10);
-  return null;
+  const t = (text || "").toLowerCase();
+  const m =
+    t.match(/(\d{1,2})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|vko|viikk)/) ||
+    t.match(/(\d{1,2})\s*(?:час|h)\b/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (n < 5 || n > 60) return null;
+  return n;
 }
+const SALARY_INTENT =
+  /(зарплат|сколько.*в\s*месяц|сколько.*получ[уи]|pay|salary|monthly|посчитай|рассчита[йть])/i;
 
 // === OpenAI client ===
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -122,6 +121,7 @@ async function sendWA(to, payload) {
 }
 const sendText = (to, body) => sendWA(to, { type: "text", text: { body, preview_url: false } });
 
+// === Media utils ===
 async function getMediaUrl(id) {
   const r = await axios.get(`https://graph.facebook.com/v20.0/${id}`, {
     headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
@@ -144,7 +144,6 @@ const CHUNK_SIZE = 1200;
 const CHUNK_OVERLAP = 200;
 
 function safeRead(p) { try { return fs.readFileSync(p, "utf8"); } catch { return ""; } }
-
 function splitIntoChunks(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
   const out = [];
   let i = 0;
@@ -158,7 +157,6 @@ function splitIntoChunks(text, size = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
   }
   return out.filter(s => s.length > 0);
 }
-
 function cosineSim(a, b) {
   let dot = 0, na = 0, nb = 0;
   for (let i = 0; i < a.length; i++) {
@@ -167,7 +165,6 @@ function cosineSim(a, b) {
   if (!na || !nb) return 0;
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
-
 async function embedBatch(texts) {
   const resp = await openai.embeddings.create({
     model: EMBEDDING_MODEL,
@@ -175,29 +172,24 @@ async function embedBatch(texts) {
   });
   return resp.data.map(d => d.embedding);
 }
-
 async function buildKBEmbeddings() {
   KB_DOCS = [];
   KB_CHUNKS = [];
-
   if (!fs.existsSync(KB_DIR)) {
     console.log("KB: /kb not found — skipping.");
     return;
   }
-
   const files = fs.readdirSync(KB_DIR).filter(f => /\.(md|txt)$/i.test(f));
   if (!files.length) {
     console.log("KB: no .md/.txt files.");
     return;
   }
-
   console.log(`KB: reading ${files.length} file(s)…`);
   for (const fn of files) {
     const text = safeRead(path.join(KB_DIR, fn));
     if (!text.trim()) continue;
     KB_DOCS.push({ name: fn, text });
   }
-
   const allChunks = [];
   for (const d of KB_DOCS) {
     const chunks = splitIntoChunks(d.text);
@@ -206,7 +198,6 @@ async function buildKBEmbeddings() {
     });
   }
   console.log(`KB: chunked into ${allChunks.length} chunk(s).`);
-
   const BATCH = 64;
   let idCounter = 0;
   for (let i = 0; i < allChunks.length; i += BATCH) {
@@ -218,16 +209,14 @@ async function buildKBEmbeddings() {
     });
     console.log(`KB: embedded ${Math.min(i + BATCH, allChunks.length)}/${allChunks.length}`);
   }
-  console.log(`KB: embeddings ready (${KB_CHUNKS.length} chunks).`);
+  console.log(`KB: embeddings ready (${KB_CHUNKS.length) chunks).`);
 }
-
 function topKRelevant(queryEmbedding, k = 6) {
   if (!KB_CHUNKS.length) return [];
   const scored = KB_CHUNKS.map(c => ({ c, score: cosineSim(queryEmbedding, c.embedding) }));
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, k).map(s => s.c);
 }
-
 function formatContextFromChunks(chunks, maxChars = 7000) {
   if (!chunks.length) return "";
   let acc = "### KB matched context\n";
@@ -240,13 +229,11 @@ function formatContextFromChunks(chunks, maxChars = 7000) {
   }
   return acc;
 }
-
 // initial load
 await buildKBEmbeddings().catch(err => console.error("KB build error:", err?.response?.data || err.message));
 
 // === Language memory ===
-const userLang = new Map(); // phone => 'fi' | 'ru' | 'en' | 'bn' | 'ne' | ...
-
+const userLang = new Map(); // phone => 'fi' | 'ru' | 'en' | ...
 async function detectLangByText(text) {
   try {
     const r = await openai.chat.completions.create({
@@ -264,7 +251,6 @@ Message:
     return /^[a-z]{2}$/.test(code) ? code : "en";
   } catch { return "en"; }
 }
-
 async function ensureUserLang(from, valueObj, sampleText) {
   if (userLang.has(from)) return userLang.get(from);
   const sys =
@@ -278,9 +264,6 @@ async function ensureUserLang(from, valueObj, sampleText) {
   userLang.set(from, guess);
   return guess;
 }
-
-// Translate UI/system phrases to user's lang (fallback EN)
-// (обновили system-промпт: никаких «извините/ограничений»)
 async function trFor(user, english) {
   const lang = userLang.get(user) || "en";
   if (lang === "en") return english;
@@ -301,7 +284,7 @@ Keep it short and natural. Do not add apologies, disclaimers, or capability stat
   }
 }
 
-// === Chat using retrieved KB chunks (обновили system-промпт) ===
+// === Chat using retrieved KB chunks ===
 async function chatWithKB(userText, userLangCode="en") {
   let ctx = "";
   try {
@@ -320,9 +303,7 @@ async function chatWithKB(userText, userLangCode="en") {
 `You are SOL — a warm, human assistant for SOL employees in Finland.
 - Respond in the user's current language (${userLangCode}). If the user writes in another language, follow the user's latest message language.
 - Be concise (3–7 short sentences), friendly, and practical.
-- Prefer ONLY facts from [KB CONTEXT] for SOL rules/rights/chemicals/safety. If the answer is not in [KB CONTEXT], say you don't know and suggest checking with a supervisor/HR.
-- Do not mention training data, knowledge cutoffs, or your internal limitations unless explicitly asked.
-- Do not say you can answer only in one language. Just answer in the language the user is using.`;
+- Prefer ONLY facts from [KB CONTEXT] for SOL rules/rights/chemicals/safety. If the answer is not in [KB CONTEXT], say you don't know and suggest checking with a supervisor/HR.`;
 
   const messages = [
     { role: "system", content: system + (ctx ? `\n\n[KB CONTEXT]\n${ctx}` : "") },
@@ -384,74 +365,13 @@ async function ocrImageBuffer(buf) {
   }
 }
 
-// === PAM pay table helper ===
-function currentPamTable(date = new Date()) {
-  const d = new Date(date);
-  if (d >= new Date('2027-07-01')) return '2027';
-  if (d >= new Date('2026-08-01')) return '2026';
-  return '2025';
-}
-
-const PAM_HOURLY = {
-  "2025": [11.03,12.26,12.88,13.52,14.20,14.90,15.50,16.12,16.77,17.44],
-  "2026": [11.33,12.59,13.22,13.88,14.58,15.30,15.92,16.55,17.22,17.90],
-  "2027": [11.60,12.89,13.54,14.21,14.92,15.67,16.30,16.95,17.63,18.33],
-};
-
-function getHourlyByGroup(group1to10, date = new Date()) {
-  const yearKey = currentPamTable(date);
-  const arr = PAM_HOURLY[yearKey];
-  const idx = Math.max(1, Math.min(10, group1to10)) - 1;
-  return { rate: arr[idx], table: yearKey };
-}
-
-function groupFromPoints(points) {
-  if (points < 17) return 1;
-  if (points <= 20) return 2;
-  if (points <= 24) return 3;
-  if (points <= 28) return 4;
-  if (points <= 33) return 5;
-  if (points <= 38) return 6;
-  if (points <= 44) return 7;
-  if (points <= 51) return 8;
-  if (points <= 58) return 9;
-  return 10;
-}
-
-
-// === Welcome (once per number) ===
-const seenUsers = new Set();
-async function maybeSendWelcome(from) {
-  if (seenUsers.has(from)) return;
-  seenUsers.add(from);
-  const msgEN = [
-    "Hi! I’m SOL — your friendly assistant.",
-    "I can:",
-    "• Answer questions about working at SOL (rights, policies, safety, chemicals).",
-    "• Read & translate screenshots/photos.",
-    "• Help with cleaning techniques.",
-    "• Share shift schedule links — just ask (e.g. “send my schedule”).",
-  ].join("\n");
-  await sendText(from, await trFor(from, msgEN));
-}
-
-
-
-function parseArrowTranslate(m) {
-  const t = m.match(/^->\s*([a-z]{2})\s+([\s\S]+)$/i);
-  if (!t) return null;
-  return { target: t[1].toLowerCase(), text: m.slice(t[0].indexOf(t[2])).trim() || t[2].trim() };
-}
-
-// === Universal "schedule" intent detector (hybrid) ===
-
-// 1) быстрый словарик
+// === Schedule intent detector (словари + AI) ===
 const SCHEDULE_KEYWORDS = [
   "schedule","shift","calendar","horario","calendario","grafik","duty",
   "расписание","смен","календарь",
   "aikataulu","vuorolista",
-  "समय","कार्यतालिका","शिफ्ट",
   "সময়সূচি","ক্যালেন্ডার","শিফট",
+  "समय","कार्यतालिका","शिफ्ट",
   "时间表","班表","工作时间",
   "勤務表","シフト","スケジュール"
 ];
@@ -460,7 +380,6 @@ const SCHEDULE_COMBOS = [
   ["сегодня","смен"], ["график","работ"], ["vuoro","tänään"],
   ["আজ","শিফট"], ["班","今天"]
 ];
-
 function fastScheduleHit(text) {
   const t = (text || "").toLowerCase();
   if (SCHEDULE_KEYWORDS.some(w => t.includes(w))) return true;
@@ -469,96 +388,31 @@ function fastScheduleHit(text) {
   }
   return false;
 }
-
-// 2) точный AI-классификатор (отвечает yes/no)
 async function isScheduleIntentAI(text, langCode) {
   try {
     const r = await axios.post("https://api.openai.com/v1/chat/completions", {
       model: process.env.OPENAI_CLASSIFIER_MODEL || "gpt-4o-mini",
       temperature: 0,
       messages: [
-        {
-          role: "system",
-          content:
-`You are a strict intent classifier. Answer exactly "yes" or "no".
-Task: Does the user ask for shift schedule or a link to the schedule/calendar?`
-        },
-        {
-          role: "user",
-          content:
-`Language: ${langCode || "unknown"}
-Text: """${(text||"").slice(0,600)}"""` // защита от длинных сообщений
-        }
+        { role: "system", content: `You are a strict intent classifier. Answer exactly "yes" or "no". Task: Does the user ask for shift schedule or a link to the schedule/calendar?` },
+        { role: "user", content: `Language: ${langCode || "unknown"}\nText: """${(text||"").slice(0,600)}"""` }
       ]
-    }, {
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
-    });
-
+    }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }});
     const out = r.data?.choices?.[0]?.message?.content?.trim().toLowerCase() || "no";
-    return out.startsWith("y"); // yes -> true, иначе false
+    return out.startsWith("y");
   } catch (e) {
     console.error("schedule intent AI error:", e?.response?.data || e.message);
     return false;
   }
 }
-
-// 3) общий вход
 async function looksLikeScheduleRequestSmart(text, langCode) {
   if (fastScheduleHit(text)) return true;
   return await isScheduleIntentAI(text, langCode);
 }
 
-// === PAM pay tables (минималки по PAM) ===
-function currentPamTable(date = new Date()) {
-  const d = new Date(date);
-  if (d >= new Date('2027-07-01')) return '2027';
-  if (d >= new Date('2026-08-01')) return '2026';
-  return '2025';
-}
-
-const PAM_HOURLY = {
-  "2025": [11.03,12.26,12.88,13.52,14.20,14.90,15.50,16.12,16.77,17.44],
-  "2026": [11.33,12.59,13.22,13.88,14.58,15.30,15.92,16.55,17.22,17.90],
-  "2027": [11.60,12.89,13.54,14.21,14.92,15.67,16.30,16.95,17.63,18.33],
-};
-
-function getHourlyByGroup(group1to10, date = new Date()) {
-  const yearKey = currentPamTable(date);
-  const arr = PAM_HOURLY[yearKey];
-  const idx = Math.max(1, Math.min(10, group1to10)) - 1;
-  return { rate: arr[idx], table: yearKey };
-}
-
-// === per-user state (ставка/часы) ===
+// === User state (ставка/часы) + small talk ===
 const USER_STATE = new Map(); // phone -> { rate?: number, hoursPerWeek?: number }
-
-// «12,26 €/ч», «12.26 eur/h», «ставка 12.26»
-function parseHourlyRate(text) {
-  const t = (text || "").replace(/\s+/g, " ").toLowerCase();
-  const m =
-    t.match(/(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)?\s*\/?\s*(?:h|ч|hr)?\b/) ||
-    t.match(/ставк[аи]:?\s*(\d{1,3}(?:[.,]\d{1,2})?)/) ||
-    t.match(/\b(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|eur)\b/);
-  if (!m) return null;
-  const num = parseFloat(m[1].replace(",", "."));
-  if (!isFinite(num) || num < 6 || num > 40) return null; // защита от «€250»
-  return +(num.toFixed(2));
-}
-
-// «20 часов в неделю», «25h/week», «25 t/vko»
-function parseHoursPerWeek(text) {
-  const t = (text || "").toLowerCase();
-  const m =
-    t.match(/(\d{1,2})\s*(?:h|ч|t)\s*\/?\s*(?:week|нед|vko|viikk)/) ||
-    t.match(/(\d{1,2})\s*(?:час|h)\b/);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  if (n < 5 || n > 40) return null;
-  return n;
-}
-
-// «режим поболтать»
-const CHITCHAT_RE = /(?:поболтаем|поговорим|просто чат|small talk|let'?s talk|я устал|мне грустно)/i;
+const CHITCHAT_RE = /(?:поболта(ть|ем)|поговорим|просто чат|small talk|let'?s talk|как дела|привет|я устал|мне грустно)/i;
 
 // === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
@@ -605,69 +459,50 @@ async function handleIncomingText(from, valueObj, body) {
     }
   } catch {}
 
-  // расписание (как было)
-  if (SCHED_REGEX.test(m)) {
+  // расписание — через умный детектор (фикс падения на SCHED_REGEX)
+  if (await looksLikeScheduleRequestSmart(m, lang)) {
     await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
     return;
   }
 
-  // дефолтная ставка PAM (группа 2)
-  const { rate: DEFAULT_RATE, table: PAM_TABLE } = getHourlyByGroup(2, new Date());
+  // ======== Детерминированный расчёт зарплаты ========
+  const wantsSalary = SALARY_INTENT.test(m) || typeof foundHours === "number" || typeof foundRate === "number";
+  if (wantsSalary) {
+    const rate = (typeof foundRate === "number" ? foundRate : (st.rate ?? DEFAULT_HOURLY));
+    const hours = (typeof foundHours === "number" ? foundHours : st.hoursPerWeek);
 
-  // системный промпт для OpenAI
-  const system = `
-You are SOL — a warm, human assistant for SOL employees in Finland.
-- Respond in the user's current language (${lang}). If the user writes in another language, follow their latest message language.
-- Be concise (3–7 short sentences), friendly, and practical.
-- Prefer ONLY facts from [KB CONTEXT] for SOL rules/rights/chemicals/safety. If the answer is not in [KB CONTEXT], say you don't know and suggest checking with a supervisor/HR.
-- Do not mention training data, knowledge cutoffs, or limitations. Do not claim you can answer only one language.
+    if (!hours) {
+      await sendText(from,
+        lang === "ru"
+          ? `Скажи, пожалуйста, сколько часов в неделю работать? Сейчас возьму ставку €${rate.toFixed(2)}/ч по умолчанию.`
+          : lang === "fi"
+          ? `Kerro viikkotunnit. Oletuksena käytän tuntipalkkaa €${rate.toFixed(2)}/h.`
+          : `Tell me your weekly hours. I’ll use €${rate.toFixed(2)}/h by default.`);
+      return;
+    }
 
-DEFAULT_ASSUMPTIONS:
-- If the user didn't specify an hourly rate, assume €${DEFAULT_RATE.toFixed(2)}/h (PAM group 2, table ${PAM_TABLE}).
-- If the user later gives another rate, use it for this user.
-- Monthly pay ≈ hours_per_week × 52 / 12 (≈4.33 weeks).
-${
-  st.rate
-    ? `USER CONTEXT: hourly_rate=€${st.rate.toFixed(2)}.`
-    : `USER CONTEXT: hourly_rate (assumed)=€${DEFAULT_RATE.toFixed(2)}.`
+    const by433 = monthlyFromWeeklyHours(rate, hours, 52/12);
+    const by4   = monthlyBy4Weeks(rate, hours);
+
+    const reply =
+      lang === "ru"
+        ? `Хорошо, считаю по твоим данным.\n• Ставка: €${rate.toFixed(2)}/ч\n• Часы в неделю: ${hours}\n\nПриблизительно в месяц:\n• По 52/12 (≈4.33 недели): €${by433}\n• По 4 неделям: €${by4}\n\nПлатят за фактически отработанные часы. Могу пересчитать в любой момент.`
+        : lang === "fi"
+        ? `Lasketaan näin:\n• Tuntipalkka: €${rate.toFixed(2)}/h\n• Tunnit/viikko: ${hours}\n\nKuukaudessa arviolta:\n• 52/12 (≈4.33 vk): €${by433}\n• 4 viikkoa: €${by4}\n\nMaksetaan toteutuneiden tuntien mukaan. Voin laskea uudestaan milloin vain.`
+        : `Got it.\n• Hourly: €${rate.toFixed(2)}/h\n• Hours/week: ${hours}\n\nApprox. per month:\n• 52/12 (≈4.33 weeks): €${by433}\n• 4 weeks: €${by4}\n\nPay is for actual hours. I can recalc anytime.`;
+
+    await sendText(from, reply);
+    return;
+  }
+  // ======== /расчёт зарплаты ========
+
+  // остальное — добрый «живой» ассистент на базе KB
+  const follow = await chatWithKB(m, userLang.get(from) || lang || "en");
+  await sendText(from, follow);
 }
-${st.hoursPerWeek ? `USER CONTEXT: hours_per_week=${st.hoursPerWeek}.` : ""}
-`;
-
-  const kb = kbContextSnippet ? kbContextSnippet() : "";
-  const userPrompt = kb
-    ? `KB START\n${kb}\nKB END\n\nQUESTION:\n${m}`
-    : `QUESTION:\n${m}\n\n(No KB loaded)`;
-
-  const r = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: 0.6,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: userPrompt }
-    ]
-  });
-
-  const out = r.choices?.[0]?.message?.content?.trim() || "(no reply)";
-  await sendText(from, out);
-}
-
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
   const lang = await ensureUserLang(from, valueObj, caption || "");
-  await maybeSendWelcome(from);
-
-  // авто-переключение языка по подписи к изображению
-  if (caption) {
-    try {
-      const latestCode = await detectLangByText(caption);
-      const prevCode = userLang.get(from);
-      if (latestCode && latestCode !== prevCode) {
-        userLang.set(from, latestCode);
-        console.log(`Language switched (image caption) for ${from}: ${prevCode} -> ${latestCode}`);
-      }
-    } catch {}
-  }
 
   try {
     const url = await getMediaUrl(mediaId);
@@ -706,19 +541,6 @@ async function handleIncomingImage(from, mediaId, caption, valueObj) {
 
 async function handleIncomingDocument(from, mediaId, filename, valueObj) {
   const lang = await ensureUserLang(from, valueObj, filename || "");
-  await maybeSendWelcome(from);
-
-  // (под документ автосмена языка обычно не нужна, но не помешает по названию)
-  if (filename) {
-    try {
-      const latestCode = await detectLangByText(filename);
-      const prevCode = userLang.get(from);
-      if (latestCode && latestCode !== prevCode) {
-        userLang.set(from, latestCode);
-        console.log(`Language switched (doc filename) for ${from}: ${prevCode} -> ${latestCode}`);
-      }
-    } catch {}
-  }
 
   try {
     const url = await getMediaUrl(mediaId);
