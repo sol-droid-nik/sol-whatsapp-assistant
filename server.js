@@ -471,6 +471,7 @@ async function handleIncomingText(from, valueObj, body) {
   const foundRate = parseHourlyRate(m);
   const foundHours = parseHoursPerWeek(m);
   const st = USER_STATE.get(from) || {};
+  if (st.rate && st.rate < 7) delete st.rate; // ниже МРОТ — выбрасываем
   if (foundRate) st.rate = foundRate;
   if (foundHours) st.hoursPerWeek = foundHours;
   if (foundRate || foundHours) USER_STATE.set(from, st);
