@@ -235,7 +235,7 @@ async function buildKBEmbeddings() {
     });
     console.log(`KB: embedded ${Math.min(i + BATCH, allChunks.length)}/${allChunks.length}`);
   }
-  console.log(`KB: embeddings ready (${KB_CHUNKS.length) chunks).`);
+  console.log(`KB: embeddings ready (${KB_CHUNKS.length} chunks).`);
 }
 function topKRelevant(queryEmbedding, k = 6) {
   if (!KB_CHUNKS.length) return [];
