@@ -124,6 +124,62 @@ const SALARY_INTENT =
 // === OpenAI client ===
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
+// ===== Translation helpers =====
+const LANG_NAME_TO_CODE = {
+  // ru names
+  "русский": "ru", "английский": "en", "финский": "fi", "непальский": "ne",
+  "бенгальский": "bn", "испанский": "es", "португальский": "pt", "французский": "fr",
+  "немецкий": "de", "итальянский": "it", "украинский": "uk", "эстонский": "et",
+  // fi names
+  "suomi": "fi", "englanti": "en", "venäjä": "ru", "nepali": "ne", "bengali": "bn",
+  // en names
+  "russian": "ru", "english": "en", "finnish": "fi", "nepali": "ne", "bengali": "bn",
+  "spanish": "es", "portuguese": "pt", "french": "fr", "german": "de", "italian": "it",
+};
+
+function langCodeFromName(word) {
+  const w = (word || "").toLowerCase().trim();
+  return LANG_NAME_TO_CODE[w] || ( /^[a-z]{2}$/.test(w) ? w : null );
+}
+
+// универсальный переводчик в код языка (не зависит от userLang)
+async function translateTo(code, text) {
+  if (!code || !text) return null;
+  try {
+    const r = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: `Translate the user's message into language ${code}. Output only the translation.` },
+        { role: "user", content: text }
+      ]
+    });
+    return r.choices?.[0]?.message?.content?.trim() || null;
+  } catch (e) {
+    console.error("translateTo error:", e?.response?.data || e.message);
+    return null;
+  }
+}
+
+// парсер команды перевода: "переведи на финский ...", "translate to finnish ...", "->fi ..."
+function parseTranslateCommand(msg) {
+  const t = (msg || "").trim();
+
+  // ->fi текст
+  let m = t.match(/^->\s*([a-z]{2})\s+([\s\S]+)$/i);
+  if (m) return { code: m[1].toLowerCase(), text: m[2].trim() };
+
+  // "переведи на <язык> <текст>" / "translate to <lang> <text>"
+  m = t.match(/^(?:переведи|перевод|translate)\s+(?:на|to)\s+([^\s:]+)\s*[:\-]?\s*([\s\S]*)$/i);
+  if (m) {
+    const code = langCodeFromName(m[1]);
+    const text = (m[2] || "").trim(); // может быть пусто -> возьмём предыдущее сообщение
+    return { code, text };
+  }
+
+  return null;
+}
+
 // === Tiny utils ===
 const two = s => (s || "").slice(0, 2).toLowerCase();
 const clamp = (s, n) => (s || "").length > n ? (s || "").slice(0, n) : (s || "");
@@ -444,6 +500,9 @@ const CHITCHAT_RE = /(?:поболта(ть|ем)|поговорим|прост�
 async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
   const m = (body || "").trim();
+  const st = USER_STATE.get(from) || {};
+st.lastText = m;               // запомним последнее сообщение
+USER_STATE.set(from, st);
 
   // сброс персональных параметров
   if (/^(reset|сброс)\s*(rate|ставка)?/i.test(m)) {
@@ -466,6 +525,29 @@ async function handleIncomingText(from, valueObj, body) {
         : "Sure, we can just chat 😊 How’s your day going?");
     return;
   }
+
+  // перевод: "переведи на финский ...", "->fi ..."
+// если текста нет — переведём предыдущее сообщение пользователя
+const trCmd = parseTranslateCommand(m);
+if (trCmd && trCmd.code) {
+  const sourceText = trCmd.text && trCmd.text.length > 0 ? trCmd.text : (st.lastTextPrev || st.lastText || "");
+  // возьмём предпредыдущее, если пользователь отправил "переведи..." следом
+  if (!sourceText) {
+    await sendText(from, await trFor(from, "Send the text to translate (or write like: ->fi your text)."));
+    return;
+  }
+  const translated = await translateTo(trCmd.code, sourceText);
+  if (translated) {
+    await sendText(from, translated);
+  } else {
+    await sendText(from, await trFor(from, "Sorry, I couldn’t translate this."));
+  }
+  return;
+}
+// обновим историю для следующей команды перевода
+st.lastTextPrev = st.lastText;
+USER_STATE.set(from, st);
+  
 
   // фиксируем, если пользователь прислал ставку/часы
   const foundRate = parseHourlyRate(m);
