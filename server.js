@@ -716,7 +716,7 @@ USER_STATE.set(from, st);
 
 await sendText(from, follow);
 return;
-
+}
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
   const lang = await ensureUserLang(from, valueObj, caption || "");
