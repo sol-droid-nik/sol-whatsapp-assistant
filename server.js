@@ -525,7 +525,8 @@ async function looksLikeScheduleRequestSmart(text, langCode) {
 
 // === User state (ставка/часы) + small talk ===
 const USER_STATE = new Map(); // phone -> { rate?: number, hoursPerWeek?: number }
-const CHITCHAT_RE = /(?:поболта(ть|ем)|поговорим|просто чат|small talk|let'?s talk|как дела|привет|я устал|мне грустно)/i;
+const CHITCHAT_RE =
+  /^(привет|hi|hello|hei|moikka|hola|salut|как дела\??|что нового\??|yo)$/i;
 
 // === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
@@ -547,16 +548,15 @@ USER_STATE.set(from, st);
   }
 
   // просто поболтать
-  if (CHITCHAT_RE.test(m)) {
-    await sendText(from,
-      lang === "ru"
-        ? "Конечно, можем просто поболтать 😊 Как ты сегодня?"
-        : lang === "fi"
-        ? "Totta kai, voidaan vain jutella 😊 Miten päiväsi on mennyt?"
-        : "Sure, we can just chat 😊 How’s your day going?");
-    return;
-  }
-
+if (CHITCHAT_RE.test(m) && m.length <= 40) {
+  await sendText(from,
+    lang === "ru"
+      ? "Конечно, можем просто поболтать 😊 Как ты сегодня?"
+      : lang === "fi"
+      ? "Totta kai, voidaan vain jutella 😊 Miten päiväsi on mennyt?"
+      : "Sure, we can just chat 😊 How’s your day going?");
+  return;
+}
   // перевод: "переведи на финский ...", "->fi ..."
 // если текста нет — переведём предыдущее сообщение пользователя
 const trCmd = parseTranslateCommand(m);
