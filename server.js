@@ -346,6 +346,37 @@ async function ensureUserLang(from, valueObj, sampleText) {
   userLang.set(from, guess);
   return guess;
 }
+
+async function classifyIntentAI(text) {
+  try {
+    const r = await openai.chat.completions.create({
+      model: OPENAI_MODEL, // у тебя уже есть
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content:
+`You are an intent router. Return strict JSON with fields:
+{"intent":"salary_calc|salary_info|schedule|translate|chitchat|other","confidence":0..1}
+Rules:
+- salary_calc: user asks to CALCULATE earnings (per month, per week, "how much if 25 h/week", "посчитай", numbers about hours/rate).
+- salary_info: questions ABOUT wages/rates/policies without asking to calculate ("какая зарплата в SOL", "минимальная ставка", "palkka-asiat").
+- schedule: shift/roster/calendar links/when do I work.
+- translate: explicit translate command ("->fi", "переведи на ...").
+- chitchat: small talk.
+- other: anything else.` },
+        { role: "user", content: text.slice(0, 1000) }
+      ]
+    });
+    const json = JSON.parse(r.choices[0].message.content || "{}");
+    const intent = json.intent || "other";
+    const conf = Math.max(0, Math.min(1, Number(json.confidence || 0)));
+    return { intent, confidence: conf };
+  } catch (e) {
+    console.error("classifyIntentAI error:", e?.response?.data || e.message);
+    return { intent: "other", confidence: 0 };
+  }
+}
+
 async function trFor(user, english) {
   const lang = userLang.get(user) || "en";
   if (lang === "en") return english;
@@ -547,6 +578,56 @@ if (trCmd && trCmd.code) {
 // обновим историю для следующей команды перевода
 st.lastTextPrev = st.lastText;
 USER_STATE.set(from, st);
+
+  // быстрые признаки
+const hasHoursOrRate = typeof foundHours === "number" || typeof foundRate === "number";
+const looksCalcByRules = SALARY_CALC_INTENT.test(m) || hasHoursOrRate;
+const looksScheduleFast = await looksLikeScheduleRequestSmart(m, lang);
+
+// если однозначно — идём сразу
+if (looksScheduleFast) {
+  await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
+  return;
+}
+if (looksCalcByRules) {
+  // ... твой блок расчёта зарплаты (как сейчас) ...
+  // (оставь как есть, просто не трогай ниже)
+  // return после отправки
+}
+
+// иначе — спросим ИИ-маршрутизатор
+const { intent, confidence } = await classifyIntentAI(m);
+
+// мягкий порог: если ИИ уверен ≥0.6 — следуем ему
+if (confidence >= 0.6) {
+  if (intent === "salary_calc") {
+    // вызвать расчёт (твой код расчёта)
+    // return после отправки
+  }
+  if (intent === "salary_info") {
+    const kbAnswer = await chatWithKB(m, userLang.get(from) || lang || "en");
+    await sendText(from, kbAnswer);
+    return;
+  }
+  if (intent === "schedule") {
+    await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
+    return;
+  }
+  if (intent === "translate") {
+    // у тебя уже есть обработчик — можно прокинуть туда или ответить подсказкой
+    await sendText(from, await trFor(from, "Use ->fi Your text or “Переведи на финский: ...”"));
+    return;
+  }
+  if (intent === "chitchat") {
+    await sendText(from, await trFor(from, "Sure — how’s your day going?"));
+    return;
+  }
+}
+
+// fallback: не ясно → ответ из KB как универсальный помощник
+const kbAnswer = await chatWithKB(m, userLang.get(from) || lang || "en");
+await sendText(from, kbAnswer);
+return;
   
 
   // фиксируем, если пользователь прислал ставку/часы
