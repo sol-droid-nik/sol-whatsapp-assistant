@@ -529,6 +529,20 @@ const USER_STATE = new Map(); // phone -> { rate?: number, hoursPerWeek?: number
 const CHITCHAT_RE =
   /^(привет|hi|hello|hei|moikka|hola|salut|как дела\??|что нового\??|yo)$/i;
 
+// === KB contextual memory helper ===
+// Если вопрос короткий, неполный — добавляем предыдущий вопрос пользователя.
+function buildKbQuery(m, st) {
+  const trimmed = (m || "").trim();
+
+  // короткое уточнение → приклеиваем контекст
+  if (trimmed.length <= 40 && st.lastKbQuestion) {
+    return `Previous user question: "${st.lastKbQuestion}".\nUser clarifies: "${trimmed}".`;
+  }
+
+  // обычный вопрос
+  return trimmed;
+}
+
 // === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
@@ -671,22 +685,37 @@ async function handleIncomingText(from, valueObj, body) {
   }
 
   // 10) Вопрос ПРО зарплату (инфо) — в KB, а не расчёт
-  if (/(зарплат|ставк|palkka|rate|salary)/i.test(m)) {
+if (/(зарплат|ставк|palkka|rate|salary)/i.test(m)) {
+
+    const query = buildKbQuery(m, st);
+
     const kbAnswer = await chatWithKB(
-      m,
+      query,
       userLang.get(from) || lang || "en"
     );
+
+    // сохраняем последний вопрос к KB
+    st.lastKbQuestion = m;
+    USER_STATE.set(from, st);
+
     await sendText(from, kbAnswer);
     return;
-  }
-
-  // 11) Остальное — универсальный ассистент на базе KB
-  const follow = await chatWithKB(
-    m,
-    userLang.get(from) || lang || "en"
-  );
-  await sendText(from, follow);
 }
+  
+  // 11) Остальное — универсальный ассистент на базе KB
+  const query = buildKbQuery(m, st);
+
+const follow = await chatWithKB(
+  query,
+  userLang.get(from) || lang || "en"
+);
+
+// сохраняем последний вопрос
+st.lastKbQuestion = m;
+USER_STATE.set(from, st);
+
+await sendText(from, follow);
+return;
 
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
