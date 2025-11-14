@@ -118,8 +118,9 @@ function parseHoursPerWeek(text) {
 
   return null;
 }
-const SALARY_INTENT =
-  /(зарплат|сколько.*в\s*месяц|сколько.*получ[уи]|pay|salary|monthly|посчитай|рассчита[йть])/i;
+const SALARY_CALC_INTENT =
+  /(посчитай|рассчита(?:й|ть)|сколько.*в\s*месяц|сколько.*получ[уи]|monthly|per\s*month|how\s*much\s*per\s*month)/i;
+
 
 // === OpenAI client ===
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
@@ -532,113 +533,83 @@ const CHITCHAT_RE =
 async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
   const m = (body || "").trim();
-  const st = USER_STATE.get(from) || {};
-st.lastText = m;               // запомним последнее сообщение
-USER_STATE.set(from, st);
 
-  // сброс персональных параметров
+  // 1) Парсим числа для зарплаты СРАЗУ, чтобы потом не было "cannot access before initialization"
+  const foundRate  = parseHourlyRate(m);
+  const foundHours = parseHoursPerWeek(m);
+
+  // 2) Состояние пользователя (память)
+  const st = USER_STATE.get(from) || {};
+  // сдвигаем историю: предыдущий текст -> lastTextPrev
+  if (st.lastText) st.lastTextPrev = st.lastText;
+  st.lastText = m;
+  USER_STATE.set(from, st);
+
+  // 3) Сброс ставки/часов
   if (/^(reset|сброс)\s*(rate|ставка)?/i.test(m)) {
     USER_STATE.delete(from);
-    await sendText(from, lang === "ru"
-      ? "Ок, сбросил ставку и часы для расчетов."
-      : lang === "fi"
-      ? "Ok, nollasin tuntipalkan ja viikkotunnit."
-      : "Okay, I reset hourly rate and weekly hours.");
+    await sendText(
+      from,
+      lang === "ru"
+        ? "Ок, сбросил ставку и часы для расчетов."
+        : lang === "fi"
+        ? "Ok, nollasin tuntipalkan ja viikkotunnit."
+        : "Okay, I reset hourly rate and weekly hours."
+    );
     return;
   }
 
-  // просто поболтать
-if (CHITCHAT_RE.test(m) && m.length <= 40) {
-  await sendText(from,
-    lang === "ru"
-      ? "Конечно, можем просто поболтать 😊 Как ты сегодня?"
-      : lang === "fi"
-      ? "Totta kai, voidaan vain jutella 😊 Miten päiväsi on mennyt?"
-      : "Sure, we can just chat 😊 How’s your day going?");
-  return;
-}
-  // перевод: "переведи на финский ...", "->fi ..."
-// если текста нет — переведём предыдущее сообщение пользователя
-const trCmd = parseTranslateCommand(m);
-if (trCmd && trCmd.code) {
-  const sourceText = trCmd.text && trCmd.text.length > 0 ? trCmd.text : (st.lastTextPrev || st.lastText || "");
-  // возьмём предпредыдущее, если пользователь отправил "переведи..." следом
-  if (!sourceText) {
-    await sendText(from, await trFor(from, "Send the text to translate (or write like: ->fi your text)."));
+  // 4) Просто поболтать (короткие приветствия)
+  if (CHITCHAT_RE.test(m) && m.length <= 40) {
+    await sendText(
+      from,
+      lang === "ru"
+        ? "Конечно, можем просто поболтать 😊 Как ты сегодня?"
+        : lang === "fi"
+        ? "Totta kai, voidaan vain jutella 😊 Miten päiväsi on mennyt?"
+        : "Sure, we can just chat 😊 How’s your day going?"
+    );
     return;
   }
-  const translated = await translateTo(trCmd.code, sourceText);
-  if (translated) {
-    await sendText(from, translated);
-  } else {
-    await sendText(from, await trFor(from, "Sorry, I couldn’t translate this."));
-  }
-  return;
-}
-// обновим историю для следующей команды перевода
-st.lastTextPrev = st.lastText;
-USER_STATE.set(from, st);
 
-  // быстрые признаки
-const hasHoursOrRate = typeof foundHours === "number" || typeof foundRate === "number";
-const looksCalcByRules = SALARY_CALC_INTENT.test(m) || hasHoursOrRate;
-const looksScheduleFast = await looksLikeScheduleRequestSmart(m, lang);
+  // 5) Перевод: "переведи на финский ...", "->fi ...".
+  const trCmd = parseTranslateCommand(m);
+  if (trCmd && trCmd.code) {
+    const sourceText =
+      (trCmd.text && trCmd.text.length > 0)
+        ? trCmd.text
+        : (st.lastTextPrev || ""); // если текст не указан — берём прошлое сообщение
 
-// если однозначно — идём сразу
-if (looksScheduleFast) {
-  await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
-  return;
-}
-if (looksCalcByRules) {
-  // ... твой блок расчёта зарплаты (как сейчас) ...
-  // (оставь как есть, просто не трогай ниже)
-  // return после отправки
-}
+    if (!sourceText) {
+      await sendText(
+        from,
+        await trFor(
+          from,
+          "Send the text to translate (or write like: ->fi your text)."
+        )
+      );
+      return;
+    }
 
-// иначе — спросим ИИ-маршрутизатор
-const { intent, confidence } = await classifyIntentAI(m);
-
-// мягкий порог: если ИИ уверен ≥0.6 — следуем ему
-if (confidence >= 0.6) {
-  if (intent === "salary_calc") {
-    // вызвать расчёт (твой код расчёта)
-    // return после отправки
-  }
-  if (intent === "salary_info") {
-    const kbAnswer = await chatWithKB(m, userLang.get(from) || lang || "en");
-    await sendText(from, kbAnswer);
+    const translated = await translateTo(trCmd.code, sourceText);
+    if (translated) {
+      await sendText(from, translated);
+    } else {
+      await sendText(
+        from,
+        await trFor(from, "Sorry, I couldn’t translate this.")
+      );
+    }
     return;
   }
-  if (intent === "schedule") {
-    await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
-    return;
-  }
-  if (intent === "translate") {
-    // у тебя уже есть обработчик — можно прокинуть туда или ответить подсказкой
-    await sendText(from, await trFor(from, "Use ->fi Your text or “Переведи на финский: ...”"));
-    return;
-  }
-  if (intent === "chitchat") {
-    await sendText(from, await trFor(from, "Sure — how’s your day going?"));
-    return;
-  }
-}
 
-// fallback: не ясно → ответ из KB как универсальный помощник
-const kbAnswer = await chatWithKB(m, userLang.get(from) || lang || "en");
-await sendText(from, kbAnswer);
-return;
-  
-
-  // фиксируем, если пользователь прислал ставку/часы
-  const foundRate = parseHourlyRate(m);
-  const foundHours = parseHoursPerWeek(m);
-  if (st.rate && st.rate < 7) delete st.rate; // ниже МРОТ — выбрасываем
-  if (foundRate) st.rate = foundRate;
-  if (foundHours) st.hoursPerWeek = foundHours;
+  // 6) Обновляем сохранённую ставку/часы (после обработки команд)
+  if (st.rate && st.rate < 7) delete st.rate; // защита от случайных "5€" и ниже МРОТ
+  if (typeof foundRate === "number") st.rate = foundRate;
+  if (typeof foundHours === "number") st.hoursPerWeek = foundHours;
   if (foundRate || foundHours) USER_STATE.set(from, st);
 
-  // авто-переключение языка по последнему сообщению
+  // 7) Авто-переключение языка по последнему сообщению
   try {
     const latestCode = await detectLangByText(m);
     const prevCode = userLang.get(from);
@@ -648,60 +619,75 @@ return;
     }
   } catch {}
 
-  // расписание — через умный детектор (фикс падения на SCHED_REGEX)
+  // 8) Расписание (умный детектор)
   if (await looksLikeScheduleRequestSmart(m, lang)) {
     await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
     return;
   }
 
-  // ======== Детерминированный расчёт зарплаты ========
-const wantsSalary =
-  SALARY_INTENT.test(m) ||
-  typeof foundHours === "number" ||
-  typeof foundRate === "number";
+  // 9) Детерминированный РАСЧЁТ зарплаты
+  const wantsSalaryCalc =
+    SALARY_CALC_INTENT.test(m) ||
+    typeof foundHours === "number" ||
+    typeof foundRate === "number";
 
-if (wantsSalary) {
-  const rate =
-    typeof foundRate === "number"
-      ? foundRate
-      : st.rate ?? DEFAULT_HOURLY;
-  const hours =
-    typeof foundHours === "number"
-      ? foundHours
-      : st.hoursPerWeek;
+  if (wantsSalaryCalc) {
+    const rate =
+      typeof foundRate === "number"
+        ? foundRate
+        : (st.rate ?? DEFAULT_HOURLY);
+    const hours =
+      typeof foundHours === "number"
+        ? foundHours
+        : st.hoursPerWeek;
 
-  if (!hours) {
-    await sendText(
-      from,
-      await trFor(
+    if (!hours) {
+      await sendText(
         from,
-        `Tell me your weekly hours. I’ll use €${rate.toFixed(
-          2
-        )}/h by default.`
-      )
-    );
+        await trFor(
+          from,
+          `Tell me your weekly hours. I’ll use €${rate.toFixed(2)}/h by default.`
+        )
+      );
+      return;
+    }
+
+    const by433 = monthlyFromWeeklyHours(rate, hours, 52 / 12);
+    const by4   = monthlyBy4Weeks(rate, hours);
+
+    let replyBase =
+      `Here’s the estimate based on your data:\n` +
+      `• Hourly rate: €${rate.toFixed(2)}/h\n` +
+      `• Hours per week: ${hours}\n\n` +
+      `Approximate monthly pay:\n` +
+      `• Using 52/12 (≈4.33 weeks): €${by433}\n` +
+      `• Using 4 weeks: €${by4}\n\n` +
+      `Pay is based on actual hours worked. I can recalculate anytime.\n\n` +
+      `💬 These amounts are before taxes.`;
+
+    const replyTranslated = await trFor(from, replyBase);
+    await sendText(from, replyTranslated);
     return;
   }
 
-  const by433 = monthlyFromWeeklyHours(rate, hours, 52 / 12);
-  const by4 = monthlyBy4Weeks(rate, hours);
+  // 10) Вопрос ПРО зарплату (инфо) — в KB, а не расчёт
+  if (/(зарплат|ставк|palkka|rate|salary)/i.test(m)) {
+    const kbAnswer = await chatWithKB(
+      m,
+      userLang.get(from) || lang || "en"
+    );
+    await sendText(from, kbAnswer);
+    return;
+  }
 
-  // Основной текст (на английском как базовый)
-  let replyBase = `Here’s the estimate based on your data:\n• Hourly rate: €${rate.toFixed(
-    2
-  )}/h\n• Hours per week: ${hours}\n\nApproximate monthly pay:\n• Using 52/12 (≈4.33 weeks): €${by433}\n• Using 4 weeks: €${by4}\n\nPay is based on actual hours worked. I can recalculate anytime.\n\n💬 These amounts are before taxes.`;
-
-  // Переводим всё на язык пользователя
-  const replyTranslated = await trFor(from, replyBase);
-
-  await sendText(from, replyTranslated);
-  return;
-}
-// ======== /расчёт зарплаты ========
-  // остальное — добрый «живой» ассистент на базе KB
-  const follow = await chatWithKB(m, userLang.get(from) || lang || "en");
+  // 11) Остальное — универсальный ассистент на базе KB
+  const follow = await chatWithKB(
+    m,
+    userLang.get(from) || lang || "en"
+  );
   await sendText(from, follow);
 }
+
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
   const lang = await ensureUserLang(from, valueObj, caption || "");
