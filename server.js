@@ -544,17 +544,7 @@ const USER_STATE = new Map(); // phone -> { rate?: number, hoursPerWeek?: number
 const CHITCHAT_RE =
   /^(привет|hi|hello|hei|moikka|hola|salut|как дела\??|что нового\??|yo)$/i;
 
-// === KB contextual memory helper ===
 
-
-  // короткое уточнение → приклеиваем контекст
-  if (trimmed.length <= 40 && st.lastKbQuestion) {
-    return `Previous user question: "${st.lastKbQuestion}".\nUser clarifies: "${trimmed}".`;
-  }
-
-  // обычный вопрос
-  return trimmed;
-}
 
 
 
