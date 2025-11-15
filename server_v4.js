@@ -196,6 +196,128 @@ async function smartAssistantReply(message, userLang) {
   return resp.choices[0]?.message?.content?.trim() || "";
 }
 
+// ===== KB SOL (embeddings + поиск по md-файлам) =====
+import fs from "fs";
+import path from "path";
+
+// Кэш embeddings, чтобы не пересчитывать при каждом запросе
+const KB_CACHE = {
+  files: [],
+  embeddings: [],
+  loaded: false,
+};
+
+// Читаем все md-файлы из папки kb
+function loadKbFiles() {
+  const kbDir = path.resolve(KB_FILES);
+  const files = fs.readdirSync(kbDir).filter(f => f.endsWith(".md"));
+
+  KB_CACHE.files = files.map(f => {
+    const content = fs.readFileSync(path.join(kbDir, f), "utf8");
+    return { name: f, content };
+  });
+}
+
+// создаём embeddings для всех файлов
+async function buildKbEmbeddings() {
+  if (!KB_CACHE.files.length) loadKbFiles();
+
+  const model = "text-embedding-3-small";
+
+  KB_CACHE.embeddings = [];
+  for (const file of KB_CACHE.files) {
+    const resp = await openai.embeddings.create({
+      model,
+      input: file.content,
+    });
+
+    KB_CACHE.embeddings.push({
+      name: file.name,
+      embedding: resp.data[0].embedding,
+      content: file.content,
+    });
+  }
+
+  KB_CACHE.loaded = true;
+  console.log("KB loaded:", KB_CACHE.embeddings.length, "files");
+}
+
+// косинусное расстояние
+function similarity(a, b) {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+// ищем самые релевантные документы
+async function searchKb(query) {
+  if (!KB_CACHE.loaded) {
+    await buildKbEmbeddings();
+  }
+
+  // embedding запроса
+  const embQ = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: query,
+  });
+
+  const q = embQ.data[0].embedding;
+
+  // сортируем файлы по успешности
+  const ranked = KB_CACHE.embeddings
+    .map(doc => ({
+      name: doc.name,
+      score: similarity(q, doc.embedding),
+      content: doc.content,
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3);
+
+  return ranked;
+}
+
+// финальное сообщение на основе KB + модели
+async function answerFromKb(query, userLang = "fi") {
+  const top = await searchKb(query);
+
+  const context = top
+    .map(doc => `# File: ${doc.name}\n${doc.content}`)
+    .join("\n\n");
+
+  const prompt = `
+Ты ассистент SOL. Используй информацию ТОЛЬКО из документов ниже.
+Если точного ответа нет в документах — скажи это вежливо и мягко.
+
+Ответ должен быть на языке пользователя (${userLang}).
+
+=== DOCUMENTS ===
+${context}
+
+=== USER QUESTION ===
+${query}
+
+Ответь ясно, коротко и по делу.
+`;
+
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.2,
+    messages: [
+      { role: "system", content: prompt },
+    ],
+  });
+
+  return resp.choices[0]?.message?.content?.trim() || "";
+}
+
 // ===== Главный обработчик входящего текста =====
 async function handleIncoming(from, text) {
   const trimmed = (text || "").trim();
