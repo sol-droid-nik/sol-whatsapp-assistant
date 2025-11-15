@@ -12,6 +12,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const KB_FILES = "./kb"; // папка с файлами SOL (мы подключим позже)
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+// Модель для всех вызовов ИИ
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
 // ===== HELPERS =====
 
@@ -71,6 +73,201 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(500);
   }
 });
+
+// ===== USER STATE (простая память по номеру) =====
+const userState = new Map(); // phone -> { lastUserText?: string, lastIntent?: string }
+
+// ===== ИИ-маршрутизатор =====
+// Определяет, что хочет пользователь: перевод, болтовню или вопрос к "умному ассистенту"
+async function classifyMessageAI(message, st = {}) {
+  const prompt = `
+Ты — маршрутизатор для ассистента SOL в WhatsApp.
+
+Определи, что хочет пользователь, и верни JSON БЕЗ лишнего текста.
+Разрешённые intent:
+- "translation" — пользователь просит ПЕРЕВЕСТИ текст на другой язык.
+- "chitchat"    — просто поболтать, small talk, приветствие, как дела и т.п.
+- "kb"          — вопрос по правилам, химикатам, отпуску, больничному и т.п.
+
+Всегда определи:
+- "user_language" — основной язык пользователя (две буквы: "ru", "fi", "en" и т.п.).
+
+Если intent = "translation", добавь:
+- "target_language"       — язык перевода (две буквы: "fi", "en", "ru", "ne", "bn" и т.д.).
+- "text_for_translation"  — что именно нужно перевести.
+    * Если пользователь написал команду и тект в ОДНОМ сообщении:
+      - в "text_for_translation" положи этот текст (без лишних объяснений).
+    * Если пользователь написал только команду типа "переведи это на английский",
+      а сам текст был В ПРЕДЫДУЩЕМ сообщении пользователя,
+      поставь "text_for_translation": "" (пустая строка) — тогда бот возьмёт прошлое сообщение.
+
+Верни СТРОГО один JSON-объект без пояснений, без комментариев, без Markdown.
+Примеры корректных ответов:
+{"intent":"translation","user_language":"ru","target_language":"fi","text_for_translation":"Здравствуйте, как дела?"}
+{"intent":"chitchat","user_language":"ru"}
+{"intent":"kb","user_language":"fi"}
+`;
+
+  const userPayload = {
+    message,
+    prev_intent: st.lastIntent || null,
+    prev_user_text: st.lastUserText || null,
+  };
+
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0,
+    messages: [
+      { role: "system", content: prompt },
+      {
+        role: "user",
+        content: JSON.stringify(userPayload, null, 2),
+      },
+    ],
+  });
+
+  let raw = resp.choices[0]?.message?.content || "{}";
+  raw = raw.trim();
+
+  try {
+    const obj = JSON.parse(raw);
+    if (!obj.intent) obj.intent = "kb";
+    if (!obj.user_language) obj.user_language = "en";
+    return obj;
+  } catch (e) {
+    console.error("Router JSON parse error:", e, raw);
+    return { intent: "kb", user_language: "en" };
+  }
+}
+
+// ===== Перевод через OpenAI =====
+const LANG_NAMES = {
+  ru: "Russian",
+  fi: "Finnish",
+  en: "English",
+  ne: "Nepali",
+  bn: "Bengali",
+};
+
+async function translateWithOpenAI(text, targetLang, sourceLang) {
+  const langName = LANG_NAMES[targetLang] || targetLang || "English";
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        `You are a professional translator. ` +
+        `Translate the USER text into ${langName}. ` +
+        `Do not explain, do not add comments, return ONLY the translated text.`,
+    },
+    {
+      role: "user",
+      content: text,
+    },
+  ];
+
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0,
+    messages,
+  });
+
+  return resp.choices[0]?.message?.content?.trim() || "";
+}
+
+// ===== Общий "умный" ответ (без KB, пока просто ИИ) =====
+async function smartAssistantReply(message, userLang) {
+  const sys = `
+Ты — дружелюбный ассистент для сотрудников SOL.
+Отвечай кратко, по делу и на языке пользователя.
+Если вопрос не про SOL (работа, химикаты, больничный, отпуск, графики, зарплата),
+всё равно отвечай, но мягко и нейтрально.
+`;
+
+  const resp = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.3,
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: message },
+    ],
+  });
+
+  return resp.choices[0]?.message?.content?.trim() || "";
+}
+
+// ===== Главный обработчик входящего текста =====
+async function handleIncoming(from, text) {
+  const trimmed = (text || "").trim();
+  if (!trimmed) return;
+
+  const st = userState.get(from) || {};
+  st.lastUserText = trimmed;
+
+  // 1) Маршрутизатор просит ИИ решить, что делать
+  let route;
+  try {
+    route = await classifyMessageAI(trimmed, st);
+  } catch (err) {
+    console.error("classifyMessageAI error:", err);
+    route = { intent: "kb", user_language: "en" };
+  }
+
+  st.lastIntent = route.intent;
+  userState.set(from, st);
+
+  const userLang = route.user_language || "en";
+
+  // 2) Обработка по intent
+  if (route.intent === "translation") {
+    let textToTranslate = (route.text_for_translation || "").trim();
+
+    // если в маршрутизаторе текст пустой — берём предыдущее сообщение пользователя
+    if (!textToTranslate) {
+      textToTranslate = st.lastUserText || trimmed;
+    }
+
+    if (!textToTranslate) {
+      await sendText(
+        from,
+        userLang === "ru"
+          ? "Напишите, пожалуйста, текст, который нужно перевести."
+          : "Please send the text you want me to translate."
+      );
+      return;
+    }
+
+    const translated = await translateWithOpenAI(
+      textToTranslate,
+      route.target_language || "en",
+      userLang
+    );
+
+    if (!translated) {
+      await sendText(
+        from,
+        userLang === "ru"
+          ? "Не удалось перевести текст. Попробуйте сформулировать запрос чуть иначе."
+          : "I couldn't translate that. Please try again with a slightly different request."
+      );
+      return;
+    }
+
+    await sendText(from, translated);
+    return;
+  }
+
+  if (route.intent === "chitchat") {
+    const reply = await smartAssistantReply(trimmed, userLang);
+    await sendText(from, reply);
+    return;
+  }
+
+  // intent === "kb" (по умолчанию) — пока просто умный ответ,
+  // позже сюда подключим поиск по KB SOL.
+  const reply = await smartAssistantReply(trimmed, userLang);
+  await sendText(from, reply);
+}
 
 // ===== START =====
 const PORT = process.env.PORT || 3000;
