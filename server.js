@@ -120,7 +120,7 @@ function parseHoursPerWeek(text) {
 }
 const SALARY_CALC_INTENT =
   /(посчитай|рассчита(?:й|ть)|сколько.*в\s*месяц|сколько.*получ[уи]|monthly|per\s*month|how\s*much\s*per\s*month)/i;
-
+const SALARY_INTENT = SALARY_CALC_INTENT;
 
 // === OpenAI client ===
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
