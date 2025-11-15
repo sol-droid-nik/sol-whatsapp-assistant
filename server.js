@@ -530,9 +530,7 @@ const CHITCHAT_RE =
   /^(привет|hi|hello|hei|moikka|hola|salut|как дела\??|что нового\??|yo)$/i;
 
 // === KB contextual memory helper ===
-// Если вопрос короткий, неполный — добавляем предыдущий вопрос пользователя.
-function buildKbQuery(m, st) {
-  const trimmed = (m || "").trim();
+
 
   // короткое уточнение → приклеиваем контекст
   if (trimmed.length <= 40 && st.lastKbQuestion) {
