@@ -338,7 +338,7 @@ async function handleIncoming(from, text) {
   st.lastIntent = route.intent;
   userState.set(from, st);
 
-  const userLang = route.user_language || "en";
+    const userLang = route.user_language || "en";
 
   // 2) Обработка по intent
   if (route.intent === "translation") {
@@ -385,11 +385,17 @@ async function handleIncoming(from, text) {
     return;
   }
 
-  // intent === "kb" (по умолчанию) — пока просто умный ответ,
-  // позже сюда подключим поиск по KB SOL.
+  if (route.intent === "kb") {
+    const reply = await answerFromKb(trimmed, userLang);
+    await sendText(from, reply);
+    return;
+  }
+
+  // на всякий случай фоллбек — просто умный ответ
   const reply = await smartAssistantReply(trimmed, userLang);
   await sendText(from, reply);
 }
+
 
 // ===== START =====
 const PORT = process.env.PORT || 3000;
