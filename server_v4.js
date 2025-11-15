@@ -85,9 +85,11 @@ async function classifyMessageAI(message, st = {}) {
 
 Определи, что хочет пользователь, и верни JSON БЕЗ лишнего текста.
 Разрешённые intent:
-- "translation" — пользователь просит ПЕРЕВЕСТИ текст на другой язык.
-- "chitchat"    — просто поболтать, small talk, приветствие, как дела и т.п.
-- "kb"          — вопрос по правилам, химикатам, отпуску, больничному и т.п.
+- "translation"   — перевод текста
+- "chitchat"      — просто поболтать
+- "kb"            — вопрос к базе знаний SOL
+- "salary_calc"   — расчёт зарплаты
+- "schedule"      — запрос расписания
 
 Всегда определи:
 - "user_language" — основной язык пользователя (две буквы: "ru", "fi", "en" и т.п.).
@@ -106,6 +108,8 @@ async function classifyMessageAI(message, st = {}) {
 {"intent":"translation","user_language":"ru","target_language":"fi","text_for_translation":"Здравствуйте, как дела?"}
 {"intent":"chitchat","user_language":"ru"}
 {"intent":"kb","user_language":"fi"}
+{"intent":"salary_calc","user_language":"ru","hours_per_week":30,"hourly_rate":12.26}
+{"intent":"schedule","user_language":"fi"}
 `;
 
   const userPayload = {
@@ -384,6 +388,65 @@ async function handleIncoming(from, text) {
     await sendText(from, reply);
     return;
   }
+
+    // ===== ЗАРПЛАТА (детерминированный расчёт) =====
+  if (route.intent === "salary_calc") {
+    const rate =
+      typeof route.hourly_rate === "number" && route.hourly_rate > 6
+        ? route.hourly_rate
+        : 12.26; // ставка по умолчанию SOL
+
+    const hours =
+      typeof route.hours_per_week === "number" &&
+      route.hours_per_week >= 5 &&
+      route.hours_per_week <= 60
+        ? route.hours_per_week
+        : null;
+
+    if (!hours) {
+      await sendText(
+        from,
+        userLang === "ru"
+          ? "Укажи, пожалуйста, сколько часов в неделю ты работаешь."
+          : "Tell me your weekly working hours."
+      );
+      return;
+    }
+
+    // Формулы
+    const by433 = (rate * hours * (52 / 12)).toFixed(2);
+    const by4 = (rate * hours * 4).toFixed(2);
+
+    let base = `
+Hourly rate: €${rate.toFixed(2)}
+Hours per week: ${hours}
+
+Estimated monthly salary:
+• 52/12 method (≈4.33 weeks): €${by433}
+• 4-week method: €${by4}
+
+💬 These amounts are BEFORE taxes.
+`;
+
+    const resp = await translateWithOpenAI(base, userLang);
+    await sendText(from, resp);
+    return;
+  }
+
+  // ===== РАСПИСАНИЕ (графики) =====
+  if (route.intent === "schedule") {
+    const url = process.env.INDEX_URL || "https://sol-droid-nik.github.io/Calendars/";
+    let msg =
+      userLang === "ru"
+        ? `Твоё расписание: ${url}`
+        : userLang === "fi"
+        ? `Työvuorolistasi: ${url}`
+        : `Your schedule: ${url}`;
+
+    await sendText(from, msg);
+    return;
+  }
+  
 
   if (route.intent === "kb") {
     const reply = await answerFromKb(trimmed, userLang);
