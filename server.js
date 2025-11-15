@@ -548,16 +548,20 @@ async function handleIncomingText(from, valueObj, body) {
   const lang = await ensureUserLang(from, valueObj, body);
   const m = (body || "").trim();
 
-  // 1) Парсим числа для зарплаты СРАЗУ, чтобы потом не было "cannot access before initialization"
-  const foundRate  = parseHourlyRate(m);
-  const foundHours = parseHoursPerWeek(m);
-
-  // 2) Состояние пользователя (память)
+  // 1) Состояние пользователя (память) + история для перевода
   const st = USER_STATE.get(from) || {};
-  // сдвигаем историю: предыдущий текст -> lastTextPrev
   if (st.lastText) st.lastTextPrev = st.lastText;
   st.lastText = m;
   USER_STATE.set(from, st);
+
+  // 2) Парсим ставку и часы СРАЗУ
+  const foundRate  = parseHourlyRate(m);
+  const foundHours = parseHoursPerWeek(m);
+
+  if (st.rate && st.rate < 7) delete st.rate; // защитимся от мусора
+  if (typeof foundRate === "number") st.rate = foundRate;
+  if (typeof foundHours === "number") st.hoursPerWeek = foundHours;
+  if (foundRate || foundHours) USER_STATE.set(from, st);
 
   // 3) Сброс ставки/часов
   if (/^(reset|сброс)\s*(rate|ставка)?/i.test(m)) {
@@ -574,7 +578,7 @@ async function handleIncomingText(from, valueObj, body) {
   }
 
   // 4) Просто поболтать (короткие приветствия)
-  if (CHITCHAT_RE.test(m) && m.length <= 40) {
+  if (CHITCHAT_RE.test(m) && m.length <= 60) {
     await sendText(
       from,
       lang === "ru"
@@ -587,12 +591,13 @@ async function handleIncomingText(from, valueObj, body) {
   }
 
   // 5) Перевод: "переведи на финский ...", "->fi ...".
+  // Если текста нет — переведём предыдущее сообщение пользователя.
   const trCmd = parseTranslateCommand(m);
   if (trCmd && trCmd.code) {
     const sourceText =
-      (trCmd.text && trCmd.text.length > 0)
+      trCmd.text && trCmd.text.length > 0
         ? trCmd.text
-        : (st.lastTextPrev || ""); // если текст не указан — берём прошлое сообщение
+        : (st.lastTextPrev || st.lastText || "");
 
     if (!sourceText) {
       await sendText(
@@ -617,13 +622,7 @@ async function handleIncomingText(from, valueObj, body) {
     return;
   }
 
-  // 6) Обновляем сохранённую ставку/часы (после обработки команд)
-  if (st.rate && st.rate < 7) delete st.rate; // защита от случайных "5€" и ниже МРОТ
-  if (typeof foundRate === "number") st.rate = foundRate;
-  if (typeof foundHours === "number") st.hoursPerWeek = foundHours;
-  if (foundRate || foundHours) USER_STATE.set(from, st);
-
-  // 7) Авто-переключение языка по последнему сообщению
+  // 6) Авто-переключение языка по последнему сообщению
   try {
     const latestCode = await detectLangByText(m);
     const prevCode = userLang.get(from);
@@ -633,23 +632,24 @@ async function handleIncomingText(from, valueObj, body) {
     }
   } catch {}
 
-  // 8) Расписание (умный детектор)
+  // 7) Расписание — умный детектор (словари + AI)
   if (await looksLikeScheduleRequestSmart(m, lang)) {
     await sendText(from, `${await trFor(from, "Schedule")}: ${INDEX_URL}`);
     return;
   }
 
-  // 9) Детерминированный РАСЧЁТ зарплаты
-  const wantsSalaryCalc =
-    SALARY_CALC_INTENT.test(m) ||
+  // 8) Детерминированный расчёт зарплаты
+  const wantsSalary =
+    SALARY_INTENT.test(m) ||
     typeof foundHours === "number" ||
     typeof foundRate === "number";
 
-  if (wantsSalaryCalc) {
+  if (wantsSalary) {
     const rate =
       typeof foundRate === "number"
         ? foundRate
-        : (st.rate ?? DEFAULT_HOURLY);
+        : st.rate ?? DEFAULT_HOURLY;
+
     const hours =
       typeof foundHours === "number"
         ? foundHours
@@ -660,7 +660,9 @@ async function handleIncomingText(from, valueObj, body) {
         from,
         await trFor(
           from,
-          `Tell me your weekly hours. I’ll use €${rate.toFixed(2)}/h by default.`
+          `Tell me your weekly hours. I’ll use €${rate.toFixed(
+            2
+          )}/h by default.`
         )
       );
       return;
@@ -684,39 +686,30 @@ async function handleIncomingText(from, valueObj, body) {
     return;
   }
 
-  // 10) Вопрос ПРО зарплату (инфо) — в KB, а не расчёт
-if (/(зарплат|ставк|palkka|rate|salary)/i.test(m)) {
-
-    const query = buildKbQuery(m, st);
-
+  // 9) Вопрос ПРО зарплату (инфо) — идём в KB, но с учётом контекста
+  if (/(зарплат|ставк|palkka|rate|salary)/i.test(m)) {
+    const kbQuestion = buildKbQuery(m, st);
     const kbAnswer = await chatWithKB(
-      query,
+      kbQuestion,
       userLang.get(from) || lang || "en"
     );
-
-    // сохраняем последний вопрос к KB
-    st.lastKbQuestion = m;
+    st.lastKbQuestion = kbQuestion;
     USER_STATE.set(from, st);
-
     await sendText(from, kbAnswer);
     return;
+  }
+
+  // 10) Остальное — универсальный ассистент на базе KB, тоже с контекстом
+  const kbQuestion = buildKbQuery(m, st);
+  const follow = await chatWithKB(
+    kbQuestion,
+    userLang.get(from) || lang || "en"
+  );
+  st.lastKbQuestion = kbQuestion;
+  USER_STATE.set(from, st);
+  await sendText(from, follow);
 }
-  
-  // 11) Остальное — универсальный ассистент на базе KB
-  const query = buildKbQuery(m, st);
 
-const follow = await chatWithKB(
-  query,
-  userLang.get(from) || lang || "en"
-);
-
-// сохраняем последний вопрос
-st.lastKbQuestion = m;
-USER_STATE.set(from, st);
-
-await sendText(from, follow);
-return;
-}
 
 async function handleIncomingImage(from, mediaId, caption, valueObj) {
   const lang = await ensureUserLang(from, valueObj, caption || "");
