@@ -162,20 +162,57 @@ async function translateTo(code, text) {
   }
 }
 
-// парсер команды перевода: "переведи на финский ...", "translate to finnish ...", "->fi ..."
-function parseTranslateCommand(msg) {
-  const t = (msg || "").trim();
+// Разбор команд перевода: "->fi ...", "переведи на финский ...", "käännä suomeksi ..."
+function parseTranslateCommand(text) {
+  const raw = (text || "").trim();
+  if (!raw) return null;
 
-  // ->fi текст
-  let m = t.match(/^->\s*([a-z]{2})\s+([\s\S]+)$/i);
-  if (m) return { code: m[1].toLowerCase(), text: m[2].trim() };
+  const lower = raw.toLowerCase();
 
-  // "переведи на <язык> <текст>" / "translate to <lang> <text>"
-  m = t.match(/^(?:переведи|перевод|translate)\s+(?:на|to)\s+([^\s:]+)\s*[:\-]?\s*([\s\S]*)$/i);
+  // 1) Формат: "->fi some text"
+  let m = raw.match(/^->\s*([a-z]{2})\s+(.+)/i);
   if (m) {
-    const code = langCodeFromName(m[1]);
-    const text = (m[2] || "").trim(); // может быть пусто -> возьмём предыдущее сообщение
-    return { code, text };
+    return {
+      code: m[1].toLowerCase(),
+      text: (m[2] || "").trim(),
+    };
+  }
+
+  // --- карта языков по словам в команде ---
+  const langMap = [
+    { re: /(финск|suom)/, code: "fi" },        // финский
+    { re: /(англ|english|engl)/, code: "en" }, // английский
+    { re: /(русск|russ|venäjä)/, code: "ru" }, // русский
+    { re: /(nepal|नेपाली)/, code: "ne" },      // непали
+    { re: /(bengal|বাংলা|bengali)/, code: "bn" } // бенгали (на будущее)
+  ];
+
+  // 2) Русско-английский формат:
+  // "переведи на финский ...", "перевод на английский: ..."
+  m = lower.match(/^(переведи|перевод|перевести|translate)\s+(?:на|to)\s+([^\s:]+)\s*:?\s*(.*)$/);
+  if (!m) {
+    // 3) Финский формат: "käännä suomeksi ...", "käännä englanniksi ..."
+    m = lower.match(/^(käännä)\s+([^\s:]+)\s*:?\s*(.*)$/);
+  }
+
+  if (m) {
+    const langWord = m[2];        // "финский" / "suomeksi" / "englanniksi"
+    const rest = m[3] || "";      // текст после команды (может быть пустым)
+    let code = null;
+
+    for (const lm of langMap) {
+      if (lm.re.test(langWord)) {
+        code = lm.code;
+        break;
+      }
+    }
+
+    if (!code) return null;
+
+    return {
+      code,
+      text: rest.trim(),          // может быть пустой строкой — это ок
+    };
   }
 
   return null;
