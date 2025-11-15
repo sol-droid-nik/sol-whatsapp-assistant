@@ -162,21 +162,66 @@ async function translateTo(code, text) {
   }
 }
 
-// Разбор команд перевода: "->fi ...", "переведи на финский ...", "käännä suomeksi ..."
+// Разбор команд перевода: "->fi ...", "переведи на финский ...", "Переведи это сообщение на Английский\n\nТекст..."
 function parseTranslateCommand(text) {
   const raw = (text || "").trim();
   if (!raw) return null;
 
-  const lower = raw.toLowerCase();
-
-  // 1) Формат: "->fi some text"
-  let m = raw.match(/^->\s*([a-z]{2})\s+(.+)/i);
+  // 1) Формат стрелкой: "->fi some text" (поддерживаем многострочный текст)
+  let m = raw.match(/^->\s*([a-z]{2})\s+([\s\S]+)/i);
   if (m) {
     return {
       code: m[1].toLowerCase(),
       text: (m[2] || "").trim(),
     };
   }
+
+  // 2) Разделяем на первую строку (команда) и остальное (текст)
+  const [firstLine, ...restLines] = raw.split(/\r?\n/);
+  const lowerFirst = firstLine.toLowerCase();
+  const restText = restLines.join("\n").trim();
+
+  // Карта языков, которые умеем распознавать в команде
+  const langMap = [
+    { re: /(финск|suom)/, code: "fi" },        // финский
+    { re: /(англ|english|engl)/, code: "en" }, // английский
+    { re: /(русск|russ|venäjä)/, code: "ru" }, // русский
+    { re: /(nepal|नेपाली)/, code: "ne" },      // непали
+    { re: /(bengal|বাংলা|bengali)/, code: "bn" } // бенгали (на будущее)
+  ];
+
+  // 3) Проверяем, есть ли вообще команда перевода в первой строке
+  if (!/(перевед[иьы]|translate|käännä)/.test(lowerFirst)) {
+    return null;
+  }
+
+  // 4) Определяем целевой язык по словам в первой строке
+  let code = null;
+  for (const lm of langMap) {
+    if (lm.re.test(lowerFirst)) {
+      code = lm.code;
+      break;
+    }
+  }
+  if (!code) return null;
+
+  // 5) Пытаемся вытащить текст из первой строки после двоеточия (если есть)
+  let textFromFirst = "";
+  const colonIdx = firstLine.indexOf(":");
+  if (colonIdx !== -1) {
+    textFromFirst = firstLine.slice(colonIdx + 1).trim();
+  }
+
+  // 6) Итоговый текст для перевода:
+  //    – если есть строки ниже команды — берём их
+  //    – иначе пробуем текст после двоеточия
+  const textToTranslate = restText || textFromFirst;
+
+  return {
+    code,
+    text: textToTranslate.trim(), // может быть пустым — тогда используем прошлое сообщение
+  };
+}
 
   // --- карта языков по словам в команде ---
   const langMap = [
