@@ -519,6 +519,21 @@ async function isScheduleIntentAI(text, langCode) {
     return false;
   }
 }
+
+// Небольшой помощник для вопросов в KB с учётом контекста
+function buildKbQuery(message, st = {}) {
+  const m = (message || "").trim();
+
+  // Если короткое уточнение по предыдущему вопросу —
+  // добавляем его в запрос, чтобы KB понимала контекст.
+  if (m.length <= 40 && st.lastKbQuestion) {
+    return `Previous user question: "${st.lastKbQuestion}".\nUser clarifies: "${m}".`;
+  }
+
+  // Обычный полный вопрос — отправляем как есть.
+  return m;
+}
+
 async function looksLikeScheduleRequestSmart(text, langCode) {
   if (fastScheduleHit(text)) return true;
   return await isScheduleIntentAI(text, langCode);
@@ -541,19 +556,7 @@ const CHITCHAT_RE =
   return trimmed;
 }
 
-// Небольшой помощник для вопросов в KB с учётом контекста
-function buildKbQuery(message, st = {}) {
-  const m = (message || "").trim();
 
-  // Если короткое уточнение по предыдущему вопросу —
-  // добавляем его в запрос, чтобы KB понимала контекст.
-  if (m.length <= 40 && st.lastKbQuestion) {
-    return `Previous user question: "${st.lastKbQuestion}".\nUser clarifies: "${m}".`;
-  }
-
-  // Обычный полный вопрос — отправляем как есть.
-  return m;
-}
 
 // === Handlers ===
 async function handleIncomingText(from, valueObj, body) {
