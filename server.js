@@ -8,7 +8,7 @@ app.use(express.json({ limit: "10mb" }));
 // ===== CONFIG =====
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const WHATSAPP_NUMBER_ID = process.env.WHATSAPP_NUMBER_ID;
+const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const KB_FILES = "./kb"; // папка с файлами SOL (мы подключим позже)
 
