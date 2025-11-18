@@ -475,57 +475,7 @@ async function handleIncoming(from, text) {
     return;
   }
 
-    // ===== ЗАРПЛАТА (детерминированный расчёт) =====
-  if (route.intent === "salary_calc") {
-    const rate =
-      typeof route.hourly_rate === "number" && route.hourly_rate > 6
-        ? route.hourly_rate
-        : 12.26; // ставка по умолчанию SOL
-
-        const resp = await translateWithOpenAI(base, userLang);
-
-    st.lastBotText = resp;
-    userState.set(from, st);
-
-    await sendText(from, resp);
-    return;
-
-    const hours =
-      typeof route.hours_per_week === "number" &&
-      route.hours_per_week >= 5 &&
-      route.hours_per_week <= 60
-        ? route.hours_per_week
-        : null;
-
-    if (!hours) {
-      await sendText(
-        from,
-        userLang === "ru"
-          ? "Укажи, пожалуйста, сколько часов в неделю ты работаешь."
-          : "Tell me your weekly working hours."
-      );
-      return;
-    }
-
-    // Формулы
-    const by433 = (rate * hours * (52 / 12)).toFixed(2);
-    const by4 = (rate * hours * 4).toFixed(2);
-
-    let base = `
-Hourly rate: €${rate.toFixed(2)}
-Hours per week: ${hours}
-
-Estimated monthly salary:
-• 52/12 method (≈4.33 weeks): €${by433}
-• 4-week method: €${by4}
-
-💬 These amounts are BEFORE taxes.
-`;
-
-    const resp = await translateWithOpenAI(base, userLang);
-    await sendText(from, resp);
-    return;
-  }
+    
 
   // ===== РАСПИСАНИЕ (графики) =====
   if (route.intent === "schedule") {
@@ -541,7 +491,52 @@ Estimated monthly salary:
     await sendText(from, msg);
     return;
   }
-  
+
+  // ===== ЗАРПЛАТА (детерминированный расчёт) =====
+if (route.intent === "salary_calc") {
+  const rate =
+    typeof route.hourly_rate === "number" && route.hourly_rate > 6
+      ? route.hourly_rate
+      : 12.26; // ставка по умолчанию
+
+  const hours =
+    typeof route.hours_per_week === "number" &&
+    route.hours_per_week >= 5 &&
+    route.hours_per_week <= 60
+      ? route.hours_per_week
+      : null;
+
+  if (!hours) {
+    await sendText(
+      from,
+      userLang === "ru"
+        ? "Укажи, пожалуйста, сколько часов в неделю ты работаешь."
+        : "Tell me your weekly working hours."
+    );
+    return;
+  }
+
+  // Формулы
+  const by433 = (rate * hours * (52 / 12)).toFixed(2);
+  const by4 = (rate * hours * 4).toFixed(2);
+
+  let base = `
+Hourly rate: €${rate.toFixed(2)}
+Hours per week: ${hours}
+
+Estimated monthly salary:
+• 52/12 method (≈4.33 weeks): €${by433}
+• 4-week method: €${by4}
+
+💬 These amounts are BEFORE taxes.
+`;
+
+  const resp = await translateWithOpenAI(base, userLang);
+  st.lastBotText = resp;
+  userState.set(from, st);
+  await sendText(from, resp);
+  return;
+}
 
      if (route.intent === "kb") {
     // Сформируем запрос в KB с учётом контекста
