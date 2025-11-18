@@ -213,6 +213,21 @@ const KB_CACHE = {
 };
 const KB_CHUNK_SIZE = 1500;       // размер кусочка в символах
 const KB_CHUNK_OVERLAP = 200;     // перекрытие между кусками
+// Помощник для формирования запроса в KB с учётом контекста
+function buildKbQuery(message, st = {}) {
+  const m = (message || "").trim();
+
+  // Если пользователь написал короткое уточнение,
+  // и у нас уже был предыдущий вопрос в KB —
+  // отправим оба: старый + уточнение.
+  if (m.length > 0 && m.length <= 60 && st.lastKbQuery) {
+    return `Previous user question: "${st.lastKbQuery}".\nUser clarifies: "${m}".`;
+  }
+
+  // Иначе — просто берём текущий текст
+  return m;
+}
+
 
 // Читаем все md-файлы из папки kb
 function loadKbFiles() {
@@ -507,14 +522,22 @@ Estimated monthly salary:
   }
   
 
-    if (route.intent === "kb") {
+     if (route.intent === "kb") {
+    // Сформируем запрос в KB с учётом контекста
+    const kbQuery = buildKbQuery(trimmed, st);
+
     try {
-      const reply = await answerFromKb(trimmed, userLang);
+      const reply = await answerFromKb(kbQuery, userLang);
       await sendText(from, reply);
+
+      // запомним последний "основной" вопрос для будущих уточнений
+      st.lastKbQuery = kbQuery;
+      userState.set(from, st);
     } catch (e) {
       console.error("answerFromKb error:", e);
+
       // запасной вариант — просто умный ассистент без KB,
-      // чтобы не молчать
+      // чтобы бот не молчал
       const fallback = await smartAssistantReply(trimmed, userLang);
       await sendText(from, fallback);
     }
