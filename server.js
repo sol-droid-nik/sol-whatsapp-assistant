@@ -291,15 +291,44 @@ async function searchKb(query) {
 
 // финальное сообщение на основе KB + модели
 async function answerFromKb(query, userLang = "fi") {
-  const top = await searchKb(query);
+  console.log("KB query:", query, "lang:", userLang);
 
+  // 1) Попробуем загрузить и найти документы
+  let top;
+  try {
+    top = await searchKb(query);
+  } catch (e) {
+    console.error("searchKb error:", e);
+    // если совсем всё плохо с KB — пусть наверх уйдёт ошибка,
+    // её перехватит handleIncoming и сделает fallback
+    throw e;
+  }
+
+  if (!top || top.length === 0) {
+    console.warn("KB: no documents found for query");
+    // Честно скажем пользователю, что в KB ничего не нашли
+    if (userLang === "ru") {
+      return "Я посмотрел внутренние документы SOL, но не нашёл точной информации по этому вопросу. Попробуй переформулировать или спросить руководителя / HR.";
+    }
+    if (userLang === "fi") {
+      return "Katsoin SOL:n sisäiset ohjeet, mutta en löytänyt tarkkaa vastausta. Voit kysyä esihenkilöltä tai HR:ltä.";
+    }
+    return "I checked the internal SOL documents but couldn’t find an exact answer. Please consider asking your supervisor or HR.";
+  }
+
+  // 2) Собираем контекст
   const context = top
     .map(doc => `# File: ${doc.name}\n${doc.content}`)
     .join("\n\n");
 
+  console.log(
+    "KB top docs:",
+    top.map(d => ({ name: d.name, score: d.score }))
+  );
+
   const prompt = `
 Ты ассистент SOL. Используй информацию ТОЛЬКО из документов ниже.
-Если точного ответа нет в документах — скажи это вежливо и мягко.
+Если точного ответа нет в документах — скажи это вежливо и мягко и порекомендуй спросить руководителя или HR.
 
 Ответ должен быть на языке пользователя (${userLang}).
 
@@ -309,7 +338,7 @@ ${context}
 === USER QUESTION ===
 ${query}
 
-Ответь ясно, коротко и по делу.
+Ответь ясно, коротко и по делу, ссылаясь только на то, что есть в документах.
 `;
 
   const resp = await openai.chat.completions.create({
