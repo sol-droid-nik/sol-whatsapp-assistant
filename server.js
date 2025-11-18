@@ -449,9 +449,17 @@ Estimated monthly salary:
   }
   
 
-  if (route.intent === "kb") {
-    const reply = await answerFromKb(trimmed, userLang);
-    await sendText(from, reply);
+    if (route.intent === "kb") {
+    try {
+      const reply = await answerFromKb(trimmed, userLang);
+      await sendText(from, reply);
+    } catch (e) {
+      console.error("answerFromKb error:", e);
+      // запасной вариант — просто умный ассистент без KB,
+      // чтобы не молчать
+      const fallback = await smartAssistantReply(trimmed, userLang);
+      await sendText(from, fallback);
+    }
     return;
   }
 
@@ -459,6 +467,7 @@ Estimated monthly salary:
   const reply = await smartAssistantReply(trimmed, userLang);
   await sendText(from, reply);
 }
+
 
 
 // ===== START =====
