@@ -419,12 +419,18 @@ async function handleIncoming(from, text) {
     const userLang = route.user_language || "en";
 
   // 2) Обработка по intent
-  if (route.intent === "translation") {
+    if (route.intent === "translation") {
     let textToTranslate = (route.text_for_translation || "").trim();
 
-    // если в маршрутизаторе текст пустой — берём предыдущее сообщение пользователя
+    // если в маршрутизаторе текст пустой:
+    // 1) пробуем перевести последний ответ бота
+    // 2) иначе берём последнее сообщение пользователя
     if (!textToTranslate) {
-      textToTranslate = st.lastUserText || trimmed;
+      if (st.lastBotText) {
+        textToTranslate = st.lastBotText;
+      } else {
+        textToTranslate = st.lastUserText || trimmed;
+      }
     }
 
     if (!textToTranslate) {
@@ -453,12 +459,18 @@ async function handleIncoming(from, text) {
       return;
     }
 
+    // запоминаем последний ответ бота
+    st.lastBotText = translated;
+    userState.set(from, st);
+
     await sendText(from, translated);
     return;
   }
 
-  if (route.intent === "chitchat") {
+    if (route.intent === "chitchat") {
     const reply = await smartAssistantReply(trimmed, userLang);
+    st.lastBotText = reply;
+    userState.set(from, st);
     await sendText(from, reply);
     return;
   }
@@ -469,6 +481,14 @@ async function handleIncoming(from, text) {
       typeof route.hourly_rate === "number" && route.hourly_rate > 6
         ? route.hourly_rate
         : 12.26; // ставка по умолчанию SOL
+
+        const resp = await translateWithOpenAI(base, userLang);
+
+    st.lastBotText = resp;
+    userState.set(from, st);
+
+    await sendText(from, resp);
+    return;
 
     const hours =
       typeof route.hours_per_week === "number" &&
@@ -516,7 +536,8 @@ Estimated monthly salary:
         : userLang === "fi"
         ? `Työvuorolistasi: ${url}`
         : `Your schedule: ${url}`;
-
+    st.lastBotText = msg;
+    userState.set(from, st);
     await sendText(from, msg);
     return;
   }
@@ -532,6 +553,7 @@ Estimated monthly salary:
 
       // запомним последний "основной" вопрос для будущих уточнений
       st.lastKbQuery = kbQuery;
+      st.lastBotText = reply;
       userState.set(from, st);
     } catch (e) {
       console.error("answerFromKb error:", e);
@@ -539,14 +561,18 @@ Estimated monthly salary:
       // запасной вариант — просто умный ассистент без KB,
       // чтобы бот не молчал
       const fallback = await smartAssistantReply(trimmed, userLang);
+      st.lastBotText = fallback;
+      userState.set(from, st);
       await sendText(from, fallback);
     }
     return;
   }
 
   // на всякий случай фоллбек — просто умный ответ
-  const reply = await smartAssistantReply(trimmed, userLang);
-  await sendText(from, reply);
+     const reply = await smartAssistantReply(trimmed, userLang);
+     st.lastBotText = reply;
+     userState.set(from, st);
+     await sendText(from, reply);
 }
 
 
