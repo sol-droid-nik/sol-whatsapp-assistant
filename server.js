@@ -211,6 +211,8 @@ const KB_CACHE = {
   embeddings: [],
   loaded: false,
 };
+const KB_CHUNK_SIZE = 1500;       // размер кусочка в символах
+const KB_CHUNK_OVERLAP = 200;     // перекрытие между кусками
 
 // Читаем все md-файлы из папки kb
 function loadKbFiles() {
@@ -228,23 +230,50 @@ async function buildKbEmbeddings() {
   if (!KB_CACHE.files.length) loadKbFiles();
 
   const model = "text-embedding-3-small";
-
   KB_CACHE.embeddings = [];
+
   for (const file of KB_CACHE.files) {
+    const full = (file.content || "").trim();
+    if (!full) continue;
+
+    // режем файл на куски с overlap
+    const chunks = [];
+    for (
+      let i = 0;
+      i < full.length;
+      i += KB_CHUNK_SIZE - KB_CHUNK_OVERLAP
+    ) {
+      const chunk = full.slice(i, i + KB_CHUNK_SIZE);
+      if (chunk.trim()) {
+        chunks.push(chunk);
+      }
+    }
+
+    // если по какой-то причине ничего не получилось — пропускаем файл
+    if (!chunks.length) continue;
+
+    // одним запросом эмбеддим все чанки этого файла
     const resp = await openai.embeddings.create({
       model,
-      input: file.content,
+      input: chunks,
     });
 
-    KB_CACHE.embeddings.push({
-      name: file.name,
-      embedding: resp.data[0].embedding,
-      content: file.content,
+    resp.data.forEach((item, idx) => {
+      KB_CACHE.embeddings.push({
+        name: file.name,
+        embedding: item.embedding,
+        content: chunks[idx],
+      });
     });
   }
 
   KB_CACHE.loaded = true;
-  console.log("KB loaded:", KB_CACHE.embeddings.length, "files");
+  console.log(
+    "KB loaded chunks:",
+    KB_CACHE.embeddings.length,
+    "from files:",
+    KB_CACHE.files.length
+  );
 }
 
 // косинусное расстояние
