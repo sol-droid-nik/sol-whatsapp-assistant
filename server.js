@@ -79,69 +79,173 @@ app.post("/webhook", async (req, res) => {
 const userState = new Map(); // phone -> { lastUserText?: string, lastIntent?: string }
 
 // ===== ИИ-маршрутизатор =====
-// Определяет, что хочет пользователь: перевод, болтовню или вопрос к "умному ассистенту"
-async function classifyMessageAI(message, st = {}) {
-  const prompt = `
-Ты — маршрутизатор для ассистента SOL в WhatsApp.
+// Маршрутизатор: ИИ решает, что это за запрос и какие данные из него вытащить
+async function classifyMessageAI(message, prevState = {}) {
+  const text = (message || "").trim();
 
-Определи, что хочет пользователь, и верни JSON БЕЗ лишнего текста.
-Разрешённые intent:
-- "translation"   — перевод текста
-- "chitchat"      — просто поболтать
-- "kb"            — вопрос к базе знаний SOL
-- "salary_calc"   — расчёт зарплаты
-- "schedule"      — запрос расписания
-
-Всегда определи:
-- "user_language" — основной язык пользователя (две буквы: "ru", "fi", "en" и т.п.).
-
-Если intent = "translation", добавь:
-- "target_language"       — язык перевода (две буквы: "fi", "en", "ru", "ne", "bn" и т.д.).
-- "text_for_translation"  — что именно нужно перевести.
-    * Если пользователь написал команду и тект в ОДНОМ сообщении:
-      - в "text_for_translation" положи этот текст (без лишних объяснений).
-    * Если пользователь написал только команду типа "переведи это на английский",
-      а сам текст был В ПРЕДЫДУЩЕМ сообщении пользователя,
-      поставь "text_for_translation": "" (пустая строка) — тогда бот возьмёт прошлое сообщение.
-
-Верни СТРОГО один JSON-объект без пояснений, без комментариев, без Markdown.
-Примеры корректных ответов:
-{"intent":"translation","user_language":"ru","target_language":"fi","text_for_translation":"Здравствуйте, как дела?"}
-{"intent":"chitchat","user_language":"ru"}
-{"intent":"kb","user_language":"fi"}
-{"intent":"salary_calc","user_language":"ru","hours_per_week":30,"hourly_rate":12.26}
-{"intent":"schedule","user_language":"fi"}
-`;
-
-  const userPayload = {
-    message,
-    prev_intent: st.lastIntent || null,
-    prev_user_text: st.lastUserText || null,
+  // базовый объект по умолчанию
+  const base = {
+    intent: "kb",
+    user_language: "ru",
+    hours_per_week: null,
+    hourly_rate: null,
+    target_language: null,
+    text_for_translation: null,
   };
 
-  const resp = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: 0,
-    messages: [
-      { role: "system", content: prompt },
-      {
-        role: "user",
-        content: JSON.stringify(userPayload, null, 2),
-      },
-    ],
-  });
+  if (!text) return base;
 
-  let raw = resp.choices[0]?.message?.content || "{}";
-  raw = raw.trim();
+  const systemPrompt = `
+Ты — маршрутизатор для WhatsApp-бота компании SOL Palvelut.
+
+Твоя задача — по одному сообщению пользователя:
+1) Определить намерение (intent).
+2) Определить язык пользователя (user_language).
+3) При необходимости вытащить числовые параметры (ставка, часы).
+4) При необходимости подготовить текст и язык для перевода.
+
+Возможные intent:
+
+- "translation" — пользователь просит ПЕРЕВЕСТИ текст
+  Примеры:
+    "Переведи на финский: Я завтра не приду"
+    "->fi I am sick"
+    "Can you translate this to English?"
+    "Напиши это клиенту по-английски"
+
+- "salary_calc" — пользователь просит ПОСЧИТАТЬ зарплату по ставке и часам.
+  Примеры:
+    "Посчитай зарплату при ставке 12,26 и 25 часов в неделю"
+    "How much will I get per month if I work 30h/week with 12.26 €/h?"
+    "Сколько я буду получать, если 20 часов в неделю по 12,26?"
+
+  ВАЖНО:
+  - salary_calc — только если пользователь ЯВНО просит посчитать
+    и есть ставка/часы (или их можно разумно спросить).
+  - Если он спрашивает просто "Какая зарплата в SOL", "Какие ставки по PAM",
+    это НЕ расчёт, это информация → тогда intent НЕ "salary_calc".
+
+- "kb" — информационный вопрос по внутренним правилам, PAM/TES, больничным,
+  отпуску, химии, безопасности и т.п.
+  Примеры:
+    "Какая сейчас зарплата в SOL?"
+    "Какие ставки по PAM для уборщиков?"
+    "Как оплачивается больничный в SOL?"
+    "Что говорит PAM про отпуск?"
+    "Miten sairasloma maksetaan SOL:ssa?"
+    "What does PAM say about salary in cleaning sector?"
+
+  ОСОБЕННО:
+  - Любые вопросы вида "какая зарплата / какие ставки / palkka / TES / PAM"
+    БЕЗ просьбы СЧИТАТЬ месячную сумму → это intent "kb".
+    Ответ должен идти из KB (PAM-файл и другие документы),
+    а не через калькулятор.
+
+- "schedule" — вопросы про расписание / рабочие смены / график.
+  Примеры:
+    "Скинь расписание"
+    "Моё työvuorot"
+    "My shifts link please"
+    "Расписание на неделю"
+
+- "chitchat" — просто поболтать, приветствие, small talk
+  Примеры:
+    "Привет", "Hei", "Hello", "Как дела?", "Miten menee?"
+
+- "other" — всё остальное (общие вопросы, не связанные с SOL).
+  Для "other" бот может отвечать как обычный ассистент.
+
+user_language:
+- "ru" — если преобладает русский
+- "fi" — финский
+- "en" — английский
+- "ne" — непальский
+- "bn" — бенгальский
+- если не уверен — выбери тот, который больше всего подходит.
+
+Если intent = "translation":
+- target_language — язык, на который нужно перевести (например "fi", "en", "ru").
+- text_for_translation — текст, который нужно перевести (если явно указан).
+
+Если intent = "salary_calc":
+- hours_per_week — число часов в неделю, если указаны (например 25).
+- hourly_rate — ставка в евро в час, если указана (например 12.26).
+- Если числа в сообщении — разделены запятой или точкой, приведи к числу.
+
+Верни ТОЛЬКО JSON без пояснений в формате:
+{
+  "intent": "...",
+  "user_language": "...",
+  "hours_per_week": null,
+  "hourly_rate": null,
+  "target_language": null,
+  "text_for_translation": null
+}
+`;
 
   try {
-    const obj = JSON.parse(raw);
-    if (!obj.intent) obj.intent = "kb";
-    if (!obj.user_language) obj.user_language = "en";
-    return obj;
-  } catch (e) {
-    console.error("Router JSON parse error:", e, raw);
-    return { intent: "kb", user_language: "en" };
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: JSON.stringify({
+            message: text,
+            prev_intent: prevState.lastIntent || null,
+            prev_language: prevState.user_language || null,
+          }),
+        },
+      ],
+    });
+
+    let raw = completion.choices[0]?.message?.content?.trim() || "";
+    // иногда модель может обернуть JSON в ```json ... ```
+    raw = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // если не удалось распарсить — вернём базовый объект
+      return base;
+    }
+
+    const result = {
+      ...base,
+      ...parsed,
+    };
+
+    // лёгкая нормализация
+    if (typeof result.hours_per_week === "string") {
+      const n = parseFloat(result.hours_per_week.replace(",", "."));
+      result.hours_per_week = isFinite(n) ? n : null;
+    }
+    if (typeof result.hourly_rate === "string") {
+      const n = parseFloat(result.hourly_rate.replace(",", "."));
+      result.hourly_rate = isFinite(n) ? n : null;
+    }
+
+    if (typeof result.hours_per_week === "number") {
+      if (result.hours_per_week <= 0 || result.hours_per_week > 80) {
+        result.hours_per_week = null;
+      }
+    }
+
+    if (typeof result.hourly_rate === "number") {
+      if (result.hourly_rate < 6 || result.hourly_rate > 40) {
+        result.hourly_rate = null;
+      }
+    }
+
+    // нормализуем язык
+    if (!result.user_language) result.user_language = "ru";
+
+    return result;
+  } catch (err) {
+    console.error("classifyMessageAI error:", err);
+    return base;
   }
 }
 
