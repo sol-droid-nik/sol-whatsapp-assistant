@@ -327,13 +327,13 @@ function buildKbQuery(message, st = {}) {
   // Если пользователь написал короткое уточнение,
   // и у нас уже был предыдущий вопрос в KB —
   // отправим оба: старый + уточнение.
-  if (m.length > 0 && m.length <= 60 && st.lastKbQuery) {
-    return `Previous user question: "${st.lastKbQuery}".\nUser clarifies: "${m}".`;
-  }
+//  if (m.length > 0 && m.length <= 60 && st.lastKbQuery) {
+//    return `Previous user question: "${st.lastKbQuery}".\nUser clarifies: "${m}".`;
+//  }
 
   // Иначе — просто берём текущий текст
-  return m;
-}
+//  return m;
+//}
 
 
 // Читаем все md-файлы из папки kb
